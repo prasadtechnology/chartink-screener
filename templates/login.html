@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sign in · VCP Scanner</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+<style>
+  body { display:flex; align-items:center; justify-content:center; min-height:100vh; padding:1.5rem; }
+  .auth-card {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 2rem;
+    max-width: 380px;
+    width: 100%;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.04);
+  }
+  .auth-brand {
+    display:flex; align-items:center; gap:.5rem;
+    font-size:.95rem; font-weight:600; margin-bottom:1.25rem;
+    color: var(--text);
+  }
+  .auth-brand-mark { color: var(--accent); font-size:1.1rem; }
+  .auth-title {
+    font-family: var(--font-display);
+    font-size: 1.7rem;
+    font-weight: 400;
+    margin-bottom: .35rem;
+    line-height: 1.15;
+  }
+  .auth-sub {
+    font-size: .85rem;
+    color: var(--text-dim);
+    margin-bottom: 1.5rem;
+  }
+  .auth-field { margin-bottom: 1rem; }
+  .auth-field label {
+    display:block;
+    font-size: .72rem;
+    color: var(--text-faint);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-weight: 500;
+    margin-bottom: .35rem;
+  }
+  .auth-field input {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border-strong);
+    color: var(--text);
+    padding: .6rem .75rem;
+    font-family: var(--font-mono);
+    font-size: .9rem;
+    border-radius: 5px;
+    outline: none;
+    transition: all .12s;
+  }
+  .auth-field input:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-dim);
+  }
+  .auth-submit {
+    width: 100%;
+    background: var(--accent);
+    color: white;
+    border: none;
+    padding: .7rem;
+    font-family: var(--font-sans);
+    font-size: .92rem;
+    font-weight: 600;
+    cursor: pointer;
+    border-radius: 6px;
+    margin-top: .25rem;
+    transition: background .15s;
+  }
+  .auth-submit:hover { background: var(--accent-hover); }
+  .auth-submit:disabled { opacity: .6; cursor: not-allowed; }
+  .auth-toggle {
+    text-align: center;
+    font-size: .82rem;
+    color: var(--text-dim);
+    margin-top: 1rem;
+  }
+  .auth-toggle button {
+    background: none; border: none;
+    color: var(--accent);
+    font-size: inherit;
+    font-weight: 500;
+    cursor: pointer;
+    padding: 0;
+  }
+  .auth-toggle button:hover { text-decoration: underline; }
+  .auth-error {
+    background: var(--neg-dim);
+    color: var(--neg);
+    padding: .6rem .75rem;
+    border-radius: 5px;
+    font-size: .82rem;
+    margin-bottom: 1rem;
+    display: none;
+  }
+  .auth-error.show { display: block; }
+  .first-user-banner {
+    background: var(--accent-dim);
+    color: var(--accent);
+    padding: .65rem .8rem;
+    border-radius: 5px;
+    font-size: .78rem;
+    margin-bottom: 1rem;
+    line-height: 1.45;
+  }
+</style>
+</head>
+<body>
+
+<div class="auth-card">
+  <div class="auth-brand">
+    <span class="auth-brand-mark">◆</span>
+    <span>VCP <span style="color:var(--text-faint)">·</span> Scanner</span>
+  </div>
+
+  {% if is_first_user %}
+  <div class="first-user-banner">
+    <strong>First-time setup.</strong> No accounts exist yet — your registration creates the admin user and inherits any existing data.
+  </div>
+  {% endif %}
+
+  <div id="loginPanel">
+    <h1 class="auth-title">Welcome back.</h1>
+    <p class="auth-sub">Sign in to your trading dashboard.</p>
+    <div class="auth-error" id="loginError"></div>
+    <form id="loginForm" onsubmit="return false">
+      <div class="auth-field">
+        <label for="loginUsername">Username</label>
+        <input type="text" id="loginUsername" autocomplete="username" required>
+      </div>
+      <div class="auth-field">
+        <label for="loginPassword">Password</label>
+        <input type="password" id="loginPassword" autocomplete="current-password" required>
+      </div>
+      <button type="submit" class="auth-submit" id="loginBtn">Sign in</button>
+    </form>
+    <div class="auth-toggle">
+      No account? <button id="toSignup">Create one</button>
+    </div>
+  </div>
+
+  <div id="signupPanel" style="display:none">
+    <h1 class="auth-title">Create account.</h1>
+    <p class="auth-sub">Pick a username and a password. 8 chars minimum.</p>
+    <div class="auth-error" id="signupError"></div>
+    <form id="signupForm" onsubmit="return false">
+      <div class="auth-field">
+        <label for="signupUsername">Username</label>
+        <input type="text" id="signupUsername" autocomplete="username" pattern="[a-z0-9_]{3,32}" required>
+      </div>
+      <div class="auth-field">
+        <label for="signupPassword">Password</label>
+        <input type="password" id="signupPassword" autocomplete="new-password" minlength="8" required>
+      </div>
+      <button type="submit" class="auth-submit" id="signupBtn">Create account</button>
+    </form>
+    <div class="auth-toggle">
+      Have an account? <button id="toLogin">Sign in</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+$('toSignup').addEventListener('click', () => {
+  $('loginPanel').style.display = 'none';
+  $('signupPanel').style.display = 'block';
+});
+$('toLogin').addEventListener('click', () => {
+  $('signupPanel').style.display = 'none';
+  $('loginPanel').style.display = 'block';
+});
+
+function showError(id, msg) {
+  const el = $(id);
+  el.textContent = msg;
+  el.classList.add('show');
+}
+function clearError(id) { $(id).classList.remove('show'); }
+
+$('loginForm').addEventListener('submit', async () => {
+  clearError('loginError');
+  $('loginBtn').disabled = true;
+  try {
+    const r = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: $('loginUsername').value,
+        password: $('loginPassword').value,
+      }),
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || 'Sign-in failed');
+    window.location.href = '/';
+  } catch (e) {
+    showError('loginError', e.message);
+    $('loginBtn').disabled = false;
+  }
+});
+
+$('signupForm').addEventListener('submit', async () => {
+  clearError('signupError');
+  $('signupBtn').disabled = true;
+  try {
+    const r = await fetch('/api/auth/signup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: $('signupUsername').value,
+        password: $('signupPassword').value,
+      }),
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || 'Sign-up failed');
+    window.location.href = '/';
+  } catch (e) {
+    showError('signupError', e.message);
+    $('signupBtn').disabled = false;
+  }
+});
+</script>
+
+</body>
+</html>

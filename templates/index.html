@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VCP Scanner · Pattern detection for breakout setups</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+<script src="{{ url_for('static', filename='lightweight-charts.standalone.production.js') }}"></script>
+</head>
+<body>
+
+<div class="bg-grid"></div>
+
+<header class="site-header">
+  <div class="brand">
+    <span class="brand-mark">◆</span>
+    <span class="brand-name">VCP<span class="brand-sep">·</span>Scanner</span>
+  </div>
+  <nav class="main-nav">
+    <button class="nav-tab active" data-view="scan">Scan</button>
+    <button class="nav-tab" data-view="holdings">Holdings <span class="nav-count" id="navHoldingsCount">0</span></button>
+  </nav>
+  <div class="header-meta">
+    <span class="status-dot" id="statusDot"></span>
+    <span id="statusText">Idle</span>
+    <span class="header-divider"></span>
+    <button class="notif-toggle" id="notifToggle" title="Toggle alerts">
+      <span class="notif-icon" id="notifIcon">🔔</span>
+    </button>
+    <button class="theme-toggle" id="themeToggle" title="Toggle dark mode">🌙</button>
+    <span class="user-pill" id="userPill" title="Click to log out">
+      <span class="user-avatar" id="userAvatar">·</span>
+      <span id="userName">…</span>
+    </span>
+  </div>
+</header>
+
+<main class="app">
+
+<!-- ================= SCAN VIEW ================= -->
+<div class="view" id="scanView">
+
+  <!-- Compact intro + uploader (side-by-side layout) -->
+  <section class="page-intro" id="heroSection">
+    <div class="intro-left">
+      <h1 class="page-title">Charts</h1>
+      <p class="page-sub">Drop a Chartink CSV to browse stocks chart-by-chart.</p>
+      <div class="exchange-pick">
+        <span>Exchange</span>
+        <label><input type="radio" name="exch" value="NSE" checked> NSE</label>
+        <label><input type="radio" name="exch" value="BSE"> BSE</label>
+      </div>
+    </div>
+
+    <div class="dropzone" id="dropzone">
+      <input type="file" id="fileInput" multiple accept=".csv" hidden>
+      <div class="dropzone-inner">
+        <div class="dropzone-icon">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4">
+            <path d="M12 3v14M5 10l7-7 7 7M5 21h14"/>
+          </svg>
+        </div>
+        <div class="dropzone-text">
+          <span class="dz-primary">Drop Chartink CSVs</span>
+          <span class="dz-secondary">or click · multiple files</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Empty state shown before any CSV is dropped -->
+  <section class="scan-empty" id="scanEmpty">
+    <div class="scan-empty-grid">
+      <div class="se-card">
+        <div class="se-icon">📂</div>
+        <div class="se-title">Drop a CSV</div>
+        <div class="se-body">Export from Chartink as CSV. Multiple files are merged and de-duplicated automatically.</div>
+      </div>
+      <div class="se-card">
+        <div class="se-icon">⌨️</div>
+        <div class="se-title">Browse fast</div>
+        <div class="se-body">Use <kbd>J</kbd> / <kbd>K</kbd> or <kbd>←</kbd> / <kbd>→</kbd> to navigate. <kbd>I</kbd> to mark interested, <kbd>S</kbd> to skip.</div>
+      </div>
+      <div class="se-card">
+        <div class="se-icon">📁</div>
+        <div class="se-title">Organize</div>
+        <div class="se-body">Move charts to custom sections (Watching, Avoid, Re-entry, etc.) as you go.</div>
+      </div>
+      <div class="se-card">
+        <div class="se-icon">📊</div>
+        <div class="se-title">Sector strength</div>
+        <div class="se-body">Check the Sector Leaders tab to see which sectors are outperforming Nifty over the last 3 months.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Parse summary + actions in one compact row -->
+  <section class="parse-summary hidden" id="parseSection">
+    <div class="parse-row">
+      <div class="parse-stats-inline">
+        <span class="ps-item"><b id="statFiles">—</b> files</span>
+        <span class="ps-sep">·</span>
+        <span class="ps-item"><b id="statRaw">—</b> raw</span>
+        <span class="ps-sep">·</span>
+        <span class="ps-item"><b class="neg" id="statDups">—</b> dupes</span>
+        <span class="ps-sep">·</span>
+        <span class="ps-item"><b class="pos" id="statUnique">—</b> unique</span>
+      </div>
+      <div class="parse-actions">
+        <button class="btn-primary" id="browseBtn">Browse charts →</button>
+        <button class="btn-link-action" id="screenBtn" title="Optional: run the algorithmic VCP/flag screener">Run algo screener</button>
+        <details class="file-details inline">
+          <summary>Files</summary>
+          <div id="perFile"></div>
+        </details>
+        <button class="btn-link" id="resetBtn">Reset</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Progress -->
+  <section class="progress-section hidden" id="progressSection">
+    <div class="section-head">
+      <h2 class="label">02 · Screening</h2>
+      <span class="progress-count" id="progressCount">0 / 0</span>
+    </div>
+    <div class="progress-bar">
+      <div class="progress-fill" id="progressFill"></div>
+    </div>
+    <div class="progress-meta" id="progressMeta">Initialising…</div>
+  </section>
+
+  <!-- Pattern-grouped results (rendered dynamically by app.js) -->
+  <div id="resultsContainer"></div>
+
+  <!-- Rejected (collapsed) -->
+  <section class="results-section hidden" id="rejectedSection">
+    <details class="rejected-details">
+      <summary>
+        <span class="label">Rejected / low score</span>
+        <span class="results-count" id="rejectedCount"></span>
+        <button class="btn-link inline" id="browseRejectedBtn" title="Browse only rejected stocks">Browse these →</button>
+      </summary>
+      <div class="results-grid" id="rejectedGrid" style="margin-top:1.25rem"></div>
+    </details>
+  </section>
+
+</div>
+
+<!-- ================= HOLDINGS VIEW ================= -->
+<div class="view hidden" id="holdingsView">
+
+  <section class="page-intro">
+    <h1 class="page-title">Holdings</h1>
+    <p class="page-sub">Live P&amp;L, open risk (if all stops hit), locked profit (if stop is trailed above entry), and R-multiple for each position. Stored in your browser.</p>
+  </section>
+
+  <!-- Holdings summary stats -->
+  <section id="holdingsSummarySection" class="hidden">
+    <div class="stat-row">
+      <div class="stat">
+        <span class="stat-label">Positions</span>
+        <span class="stat-val" id="hsPositions">0</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Invested</span>
+        <span class="stat-val mono-lg" id="hsInvested">—</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Total P&amp;L</span>
+        <span class="stat-val" id="hsPnl">—</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Open risk</span>
+        <span class="stat-val" id="hsOpenRisk">—</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- Add holding form -->
+  <section class="holding-form-section">
+    <div class="section-head">
+      <h2 class="label">Add position</h2>
+      <button class="btn-link" id="refreshHoldingsBtn">Refresh prices</button>
+    </div>
+    <form id="holdingForm" class="holding-form" onsubmit="return false">
+      <div class="hf-field">
+        <label>Symbol</label>
+        <input type="text" id="hfSymbol" placeholder="MTARTECH" autocomplete="off" required>
+      </div>
+      <div class="hf-field">
+        <label>Exchange</label>
+        <select id="hfExchange">
+          <option value="NSE">NSE</option>
+          <option value="BSE">BSE</option>
+        </select>
+      </div>
+      <div class="hf-field">
+        <label>Entry ₹</label>
+        <input type="number" id="hfEntry" step="0.01" placeholder="3776" required>
+      </div>
+      <div class="hf-field">
+        <label>Stop ₹</label>
+        <input type="number" id="hfStop" step="0.01" placeholder="3500" required>
+      </div>
+      <div class="hf-field">
+        <label>Qty</label>
+        <input type="number" id="hfQty" step="1" placeholder="100" required>
+      </div>
+      <button type="submit" class="btn-primary" id="addHoldingBtn">
+        <span>Add</span><span class="btn-arrow">+</span>
+      </button>
+    </form>
+  </section>
+
+  <!-- Holdings table -->
+  <section id="holdingsListSection">
+    <div class="section-head">
+      <h2 class="label">Open positions</h2>
+    </div>
+    <div id="holdingsEmpty" class="empty-state">
+      <p>No positions yet. Add one above, or <button class="btn-link inline" id="loadSampleBtn">load sample</button>.</p>
+    </div>
+    <div class="holdings-table hidden" id="holdingsTable"></div>
+  </section>
+
+</div>
+
+</main>
+
+<!-- Detail modal -->
+<div class="modal-backdrop hidden" id="modal">
+  <div class="modal">
+    <button class="modal-close" id="modalClose">×</button>
+    <div class="modal-content" id="modalContent"></div>
+  </div>
+</div>
+
+<footer class="site-footer">
+  <span>Built for Minervini-style trend following. Not investment advice.</span>
+  <span class="footer-meta">Data via yfinance · Pattern detection: <span class="mono">VCP · flat · cup</span></span>
+</footer>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

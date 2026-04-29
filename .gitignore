@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.python-version
+
+# SQLite database (user data — don't commit)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Logs
+*.log
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Uploaded CSVs
+uploads/*
+!uploads/.gitkeep
+
+# Build outputs
+dist/
+build/
+
+# Flask session secret (auto-generated)
+.flask_secret
+
+# Backtest cache and results (machine-generated)
+backtest_cache/
+backtest_results*.json
+*_results.json
