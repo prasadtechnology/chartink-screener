@@ -11,7 +11,9 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-DB_PATH = Path(os.environ.get('VCP_DB', 'vcp_scanner.db')).resolve()
+DB_PATH = Path(
+    os.environ.get('VCP_DB_PATH') or os.environ.get('VCP_DB') or 'vcp_scanner.db'
+).resolve()
 
 
 @contextmanager

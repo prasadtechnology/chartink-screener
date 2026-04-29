@@ -1,0 +1,21 @@
+# Render deployment config
+# https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: vcp-scanner
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: VCP_SECRET_PATH
+        value: /var/data/.flask_secret
+      - key: VCP_DB_PATH
+        value: /var/data/vcp_scanner.db
+      # Set ALLOW_SIGNUP=1 in dashboard ONLY for the very first signup, then remove
+    disk:
+      name: vcp-data
+      mountPath: /var/data
+      sizeGB: 1
