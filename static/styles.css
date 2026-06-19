@@ -1669,20 +1669,24 @@ body { position: relative; overflow-x: hidden; }
 }
 
 /* ---------- Browse mode: chart-first layout ---------- */
-/* Hide everything that's not chart-related when in browse mode */
+/* Hide everything that's not chart-related when in browse mode.
+   (This rule was broken — its declaration block was lost — which is why
+   the oversized symbol title kept rendering and pushed the chart down.) */
 #modal.browse-mode .modal-head,
 #modal.browse-mode .modal-section,
 #modal.browse-mode .modal-grid,
-#modal.browse-mode .indicators-panel,
-#modal.browse-mode 
+#modal.browse-mode .indicators-panel {
+  display: none;
+}
 
-/* Make the modal content tighter and the chart taller */
+/* Tighten the content padding and let the chart fill the modal. The height is
+   capped to the modal's 92vh max so the chart fills without an inner scrollbar. */
 #modal.browse-mode .modal-content {
-  padding: 0.75rem 1rem;
+  padding: 0.6rem 1rem;
 }
 #modal.browse-mode .modal-chart {
-  height: calc(100vh - 200px);
-  min-height: 480px;
+  height: calc(92vh - 156px);
+  min-height: 440px;
 }
 /* Drawing toolbar still useful but compact */
 #modal.browse-mode .draw-toolbar {
