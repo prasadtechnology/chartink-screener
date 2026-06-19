@@ -155,13 +155,15 @@ except Exception:
 
 
 def trading_date_today():
-    """Return today's IST date as YYYY-MM-DD string.
+    """Return today's calendar date in IST as a YYYY-MM-DD string.
 
-    Note: this is calendar 'today' in IST, not the last trading day. If today
-    is a Sunday, we return Sunday. The cache will miss for symbols not yet
-    fetched today, hit yfinance, and yfinance will return Friday's data —
-    which is what we want. The cached_date we store is the date of the LATEST
-    bar in the data, not today's calendar date.
+    This stamp is the cache's freshness key: an entry counts as fresh only if
+    it was stored on the same IST calendar date. Note this is calendar 'today',
+    not the last *trading* day — on a weekend or holiday, an entry stored on a
+    previous calendar day is treated as stale and re-fetched once. yfinance
+    simply returns the last trading day's bars again, so the data stays
+    correct; the cost is one redundant fetch per symbol per calendar day, an
+    acceptable trade-off for not maintaining an NSE holiday calendar.
     """
     if _IST:
         return _dt.datetime.now(_IST).strftime('%Y-%m-%d')
@@ -356,11 +358,6 @@ def get_user_by_id(user_id):
     with get_conn() as conn:
         row = conn.execute('SELECT * FROM users WHERE id = ?', (user_id,)).fetchone()
         return dict(row) if row else None
-
-
-def user_count():
-    with get_conn() as conn:
-        return conn.execute('SELECT COUNT(*) AS n FROM users').fetchone()['n']
 
 
 # ---------------- Holdings ----------------

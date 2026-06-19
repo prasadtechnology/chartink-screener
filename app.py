@@ -7,15 +7,19 @@ Flask's signed cookie. First registered user owns any pre-existing data
 
 Every API route uses @login_required and scopes data to session['user_id'].
 """
+import concurrent.futures
 import io
 import json
 import math
 import os
 import re
 import secrets
+import time
 import traceback
+from collections import defaultdict
 from functools import wraps
 from pathlib import Path
+from threading import Lock
 
 import pandas as pd
 import yfinance as yf
@@ -23,11 +27,24 @@ from flask import (Flask, jsonify, redirect, render_template, request, session,
                    url_for)
 from werkzeug.security import check_password_hash, generate_password_hash
 
-from vcp_screener import score_and_analyse
+from sector_data import SECTOR_CONSTITUENTS
+from sector_rs import NIFTY_TICKER, compute_sector_rankings, fetch_close_series
+from vcp_screener import (compute_moving_averages, fetch_ohlc,
+                          score_and_analyse)
 import db
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
+
+# Harden session cookies. SESSION_COOKIE_SECURE is gated behind an env flag so
+# local HTTP development still works (a Secure cookie is never sent over plain
+# HTTP, which would break login on 127.0.0.1). Set COOKIE_SECURE=1 in any HTTPS
+# deployment (e.g. Render).
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    SESSION_COOKIE_SECURE=os.environ.get('COOKIE_SECURE', '').strip() == '1',
+)
 
 # Session signing — pulled from env, otherwise generated and persisted to disk
 # so cookies survive server restarts but stay private to this install.
@@ -68,6 +85,31 @@ def login_required(view):
 
 def current_user_id():
     return session.get('user_id')
+
+
+# ---------------------------------------------------------------------------
+# Lightweight in-process login rate limiting (brute-force defense).
+# No external dependency; adequate for a single-worker deployment. Behind a
+# reverse proxy request.remote_addr is the proxy's IP, so the bucket is shared
+# across clients — fine for a single-user instance.
+# ---------------------------------------------------------------------------
+_auth_attempts: dict[str, list[float]] = defaultdict(list)
+_auth_lock = Lock()
+AUTH_MAX_ATTEMPTS = 10
+AUTH_WINDOW_SEC = 300  # 5 minutes
+
+
+def auth_rate_limited(ip: str) -> bool:
+    """Record an auth attempt for `ip`; return True if it exceeds the window cap."""
+    now = time.time()
+    cutoff = now - AUTH_WINDOW_SEC
+    with _auth_lock:
+        attempts = _auth_attempts[ip]
+        attempts[:] = [t for t in attempts if t > cutoff]
+        if len(attempts) >= AUTH_MAX_ATTEMPTS:
+            return True
+        attempts.append(now)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +163,9 @@ def signup():
     created. Override with the env var ALLOW_SIGNUP=1 if you ever need to
     create another account.
     """
+    if auth_rate_limited(request.remote_addr or 'unknown'):
+        return jsonify({'error': 'Too many attempts. Please wait a few minutes and try again.'}), 429
+
     allow_signup = os.environ.get('ALLOW_SIGNUP', '').strip() == '1'
     if not allow_signup and db.user_count() >= 1:
         return jsonify({
@@ -150,6 +195,9 @@ def signup():
 
 @app.route('/api/auth/login', methods=['POST'])
 def auth_login():
+    if auth_rate_limited(request.remote_addr or 'unknown'):
+        return jsonify({'error': 'Too many attempts. Please wait a few minutes and try again.'}), 429
+
     data = request.get_json() or {}
     username = (data.get('username') or '').strip().lower()
     password = data.get('password') or ''
@@ -249,9 +297,10 @@ def screen_one():
         result['_cached'] = False
         return jsonify(result)
     except Exception as e:
+        # Log full detail server-side; don't leak tracebacks/paths to the client.
+        print(f'[screen_one] {symbol} failed: {traceback.format_exc()}')
         return jsonify({
-            'input_symbol': symbol, 'ticker': ticker, 'error': str(e),
-            'trace': traceback.format_exc(), 'score': 0,
+            'input_symbol': symbol, 'ticker': ticker, 'error': str(e), 'score': 0,
         })
 
 
@@ -275,8 +324,6 @@ def chart_data():
         if cached is not None:
             cached['_cached'] = True
             return jsonify(cached)
-
-    from vcp_screener import fetch_ohlc, compute_moving_averages
 
     ticker = to_yfinance_ticker(symbol, exchange)
     try:
@@ -312,7 +359,8 @@ def chart_data():
         payload['_cached'] = False
         return jsonify(payload)
     except Exception as e:
-        return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
+        print(f'[chart_data] {symbol}/{interval} failed: {traceback.format_exc()}')
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/cache/clear', methods=['POST'])
@@ -419,6 +467,29 @@ def holdings_refresh():
     if not holdings:
         return jsonify({'holdings': [], 'summary': {}})
 
+    # Fetch the latest price for every distinct ticker in parallel — yfinance
+    # I/O dominates, while the per-position math below is cheap. (Same pattern
+    # as the sector endpoint.)
+    tickers = {to_yfinance_ticker(h['symbol'], h['exchange']) for h in holdings}
+
+    def fetch_cmp(ticker):
+        try:
+            df = yf.download(ticker, period='5d', progress=False,
+                             auto_adjust=True, threads=False)
+            if df is None or df.empty:
+                return ticker, None, 'No data'
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [c[0] for c in df.columns]
+            df.columns = [c.lower() for c in df.columns]
+            return ticker, float(df['close'].iloc[-1]), None
+        except Exception as e:
+            return ticker, None, str(e)
+
+    cmp_by_ticker = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(tickers))) as ex:
+        for ticker, last_close, err in ex.map(fetch_cmp, tickers):
+            cmp_by_ticker[ticker] = (last_close, err)
+
     results = []
     total_invested = total_value = total_open_risk = total_locked_profit = 0.0
 
@@ -428,42 +499,34 @@ def holdings_refresh():
         entry = float(h['entry']); stop = float(h['stop']); qty = int(h['qty'])
         ticker = to_yfinance_ticker(sym, exch)
         out = dict(h, ticker=ticker)
-        try:
-            df = yf.download(ticker, period='5d', progress=False,
-                             auto_adjust=True, threads=False)
-            if df is None or df.empty:
-                out['error'] = 'No data'; out['cmp'] = None
+        cmp, err = cmp_by_ticker.get(ticker, (None, 'No data'))
+        if err is not None or cmp is None:
+            out['error'] = err or 'No data'; out['cmp'] = None
+        else:
+            invested = entry * qty
+            value = cmp * qty
+            pnl = value - invested
+            pnl_pct = (cmp / entry - 1) * 100 if entry > 0 else 0
+            initial_risk = (entry - stop) * qty if stop < entry else 0
+            if cmp > stop:
+                open_risk = (cmp - stop) * qty
+                locked_profit = (stop - entry) * qty if stop > entry else 0
             else:
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = [c[0] for c in df.columns]
-                df.columns = [c.lower() for c in df.columns]
-                cmp = float(df['close'].iloc[-1])
-                invested = entry * qty
-                value = cmp * qty
-                pnl = value - invested
-                pnl_pct = (cmp / entry - 1) * 100 if entry > 0 else 0
-                initial_risk = (entry - stop) * qty if stop < entry else 0
-                if cmp > stop:
-                    open_risk = (cmp - stop) * qty
-                    locked_profit = (stop - entry) * qty if stop > entry else 0
-                else:
-                    open_risk = 0; locked_profit = pnl
-                rps = entry - stop if entry > stop else 0
-                r_mult = (cmp - entry) / rps if rps > 0 else 0
-                out.update({
-                    'cmp': round(cmp, 2),
-                    'invested': round(invested, 2), 'value': round(value, 2),
-                    'pnl': round(pnl, 2), 'pnl_pct': round(pnl_pct, 2),
-                    'initial_risk': round(initial_risk, 2),
-                    'open_risk': round(open_risk, 2),
-                    'locked_profit': round(locked_profit, 2),
-                    'r_multiple': round(r_mult, 2),
-                    'stop_hit': cmp <= stop,
-                })
-                total_invested += invested; total_value += value
-                total_open_risk += open_risk; total_locked_profit += locked_profit
-        except Exception as e:
-            out['error'] = str(e); out['cmp'] = None
+                open_risk = 0; locked_profit = pnl
+            rps = entry - stop if entry > stop else 0
+            r_mult = (cmp - entry) / rps if rps > 0 else 0
+            out.update({
+                'cmp': round(cmp, 2),
+                'invested': round(invested, 2), 'value': round(value, 2),
+                'pnl': round(pnl, 2), 'pnl_pct': round(pnl_pct, 2),
+                'initial_risk': round(initial_risk, 2),
+                'open_risk': round(open_risk, 2),
+                'locked_profit': round(locked_profit, 2),
+                'r_multiple': round(r_mult, 2),
+                'stop_hit': cmp <= stop,
+            })
+            total_invested += invested; total_value += value
+            total_open_risk += open_risk; total_locked_profit += locked_profit
         results.append(out)
 
     total_pnl = total_value - total_invested
@@ -612,9 +675,6 @@ def sectors_leaders():
         lookback (int, default 63): trading days lookback
         refresh (1/true): force re-fetch, bypass cache
     """
-    from sector_rs import compute_sector_rankings, fetch_close_series, NIFTY_TICKER
-    from sector_data import SECTOR_CONSTITUENTS
-
     try:
         lookback = int(request.args.get('lookback', 63))
         if lookback < 10 or lookback > 252:
@@ -641,14 +701,12 @@ def sectors_leaders():
     for stocks in SECTOR_CONSTITUENTS.values():
         all_syms.update(stocks)
 
-    import concurrent.futures
-    import time as _time
     series_by_symbol = {}
     failed_syms = []
 
     def fetch_one(sym):
         # Small jitter to space requests out and avoid Yahoo's burst limit
-        _time.sleep(0.15)
+        time.sleep(0.15)
         return sym, fetch_close_series(f'{sym}.NS', days=lookback + 30)
 
     # Reduced from 6 → 3 workers; Yahoo throttles parallel hits

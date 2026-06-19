@@ -331,22 +331,6 @@ def classify_pattern(pullbacks_clean, base_weeks, base_range_pct):
     if max_pb <= 12:
         return 'Tight range'
     return 'Loose base'
-    """Classify the base type based on structure."""
-    if not pullbacks_clean:
-        return 'Unknown'
-    n = len(pullbacks_clean)
-    max_pb = max(pullbacks_clean)
-    if n >= 3 and max_pb <= 20 and pullbacks_clean[-1] <= 6:
-        return 'VCP (tight)'
-    if n >= 2 and max_pb <= 35 and pullbacks_clean[-1] <= 10:
-        return 'VCP'
-    if max_pb >= 30 and base_weeks >= 7:
-        return 'Cup base'
-    if base_range_pct <= 15 and n <= 2:
-        return 'Flat base'
-    if max_pb <= 12:
-        return 'Tight range'
-    return 'Loose base'
 
 
 def compute_entry_stop(df, base_start_abs, swings_abs, pullbacks_clean, cfg):

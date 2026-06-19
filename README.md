@@ -67,10 +67,12 @@ Chart data is cached in SQLite per symbol per timeframe per day. First view of T
 
 ## Configuration
 
-Two environment variables:
+Environment variables:
 
 - `ALLOW_SIGNUP=1` — unlock signup (default: locked after first user)
 - `VCP_SECRET_PATH=/path/to/secret` — Flask session signing key (default: `.flask_secret` in cwd, auto-generated)
+- `VCP_DB_PATH=/path/to/vcp_scanner.db` — SQLite database location (default: `vcp_scanner.db` in cwd)
+- `COOKIE_SECURE=1` — mark session cookies `Secure` (set this on any HTTPS deployment; leave unset for local HTTP dev)
 
 ## Backtest scripts (for reference, not deployed)
 
