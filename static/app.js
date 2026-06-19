@@ -18,6 +18,122 @@ const state = {
 
 // DOM refs
 const $ = (id) => document.getElementById(id);
+
+// Escape user-supplied text before interpolating into innerHTML (section
+// names, error messages, etc.). Safe for element text and quoted attributes.
+const esc = (s) => String(s == null ? '' : s)
+  .replace(/&/g, '&amp;')
+  .replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;')
+  .replace(/'/g, '&#39;');
+
+// ---------------------------------------------------------------------------
+// Inline SVG icons (Lucide-style, currentColor stroke) — replaces emoji so the
+// UI reads consistently across platforms and themes. svgIcon(name, size) returns
+// markup; stroke inherits the element's color, so hover/active states just work.
+// ---------------------------------------------------------------------------
+const ICONS = {
+  bell: '<path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/>',
+  bellOff: '<path d="M8.7 3A6 6 0 0 1 18 8c0 2.6.5 4.4 1.1 5.7"/><path d="M17.5 17.5H3s3-2 3-9c0-.6.1-1.2.2-1.7"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/><path d="m2 2 20 20"/>',
+  moon: '<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>',
+  sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
+  x: '<path d="M18 6 6 18M6 6l12 12"/>',
+  star: '<path d="M12 3.2l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L4.4 9.3l5.8-.8z"/>',
+  upload: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 9l5-5 5 5"/><path d="M12 4v12"/>',
+  keyboard: '<rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M6 14h.01M18 14h.01M9.5 14h5"/>',
+  folder: '<path d="M4 20a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h4.9a2 2 0 0 1 1.7.9l.8 1.1H20a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2Z"/>',
+  chart: '<path d="M3 3v18h18"/><path d="M7 15v-4M12 15V8M17 15v-6"/>',
+  more: '<circle cx="5" cy="12" r="1.5" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.5" fill="currentColor" stroke="none"/><circle cx="19" cy="12" r="1.5" fill="currentColor" stroke="none"/>',
+  info: '<circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/>',
+  refresh: '<path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 4v5h-5"/>',
+  arrowRight: '<path d="M5 12h14M13 6l6 6-6 6"/>',
+  arrowLeft: '<path d="M19 12H5M11 6l-6 6 6 6"/>',
+  activity: '<path d="M22 12h-4l-3 8L9 4l-3 8H2"/>',
+  check: '<path d="M20 6 9 17l-5-5"/>',
+  alertTriangle: '<path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4M12 17h.01"/>',
+};
+function svgIcon(name, size = 18) {
+  return `<svg class="icon" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ''}</svg>`;
+}
+
+// ---------------------------------------------------------------------------
+// Toasts — non-blocking transient feedback (replaces alert() for messages).
+// type: 'info' | 'success' | 'error'. Auto-dismisses; click × to close early.
+// ---------------------------------------------------------------------------
+function showToast(message, type = 'info', timeout = 3400) {
+  const host = $('toastHost');
+  if (!host) { console.warn('[toast]', message); return; }
+  const el = document.createElement('div');
+  el.className = `toast toast-${type}`;
+  el.setAttribute('role', type === 'error' ? 'alert' : 'status');
+  const mark = type === 'success' ? svgIcon('check', 16) : type === 'error' ? svgIcon('alertTriangle', 16) : svgIcon('info', 16);
+  el.innerHTML = `<span class="toast-icon">${mark}</span><span class="toast-msg"></span><button class="toast-x" aria-label="Dismiss">${svgIcon('x', 15)}</button>`;
+  el.querySelector('.toast-msg').textContent = message;   // textContent — never HTML
+  let done = false;
+  const dismiss = () => {
+    if (done) return;
+    done = true;
+    el.classList.remove('show');
+    setTimeout(() => el.remove(), 220);
+  };
+  el.querySelector('.toast-x').addEventListener('click', dismiss);
+  host.appendChild(el);
+  requestAnimationFrame(() => el.classList.add('show'));
+  if (timeout) setTimeout(dismiss, timeout);
+  return el;
+}
+
+// ---------------------------------------------------------------------------
+// Styled confirm dialog — returns Promise<boolean>. Replaces window.confirm().
+// Escape / backdrop / Cancel resolve false; Enter / OK resolve true. Keydown
+// is captured so it doesn't leak to the browse-mode and modal handlers.
+// ---------------------------------------------------------------------------
+function confirmDialog(message, opts = {}) {
+  const {
+    title = 'Are you sure?',
+    confirmLabel = 'Confirm',
+    cancelLabel = 'Cancel',
+    danger = false,
+  } = opts;
+  return new Promise((resolve) => {
+    const backdrop = $('confirmBackdrop');
+    if (!backdrop) { resolve(window.confirm(message)); return; }
+    $('confirmTitle').textContent = title;
+    $('confirmMsg').textContent = message || '';
+    $('confirmMsg').style.display = message ? '' : 'none';
+    const okBtn = $('confirmOk');
+    const cancelBtn = $('confirmCancel');
+    okBtn.textContent = confirmLabel;
+    cancelBtn.textContent = cancelLabel;
+    okBtn.classList.toggle('btn-danger', !!danger);
+    backdrop.classList.remove('hidden');
+    const prevFocus = document.activeElement;
+    okBtn.focus();
+
+    function cleanup(result) {
+      backdrop.classList.add('hidden');
+      okBtn.removeEventListener('click', onOk);
+      cancelBtn.removeEventListener('click', onCancel);
+      backdrop.removeEventListener('mousedown', onBackdrop);
+      document.removeEventListener('keydown', onKey, true);
+      if (prevFocus && prevFocus.focus) { try { prevFocus.focus(); } catch (_) {} }
+      resolve(result);
+    }
+    const onOk = () => cleanup(true);
+    const onCancel = () => cleanup(false);
+    const onBackdrop = (e) => { if (e.target === backdrop) cleanup(false); };
+    const onKey = (e) => {
+      if (e.key === 'Escape') { e.stopPropagation(); e.preventDefault(); cleanup(false); }
+      else if (e.key === 'Enter') { e.stopPropagation(); e.preventDefault(); cleanup(true); }
+    };
+    okBtn.addEventListener('click', onOk);
+    cancelBtn.addEventListener('click', onCancel);
+    backdrop.addEventListener('mousedown', onBackdrop);
+    document.addEventListener('keydown', onKey, true);
+  });
+}
+
 const dropzone = $('dropzone');
 const fileInput = $('fileInput');
 const parseSection = $('parseSection');
@@ -71,7 +187,7 @@ async function handleFiles(files) {
     setStatus('done', 'Parsed');
   } catch (err) {
     setStatus('error', 'Parse failed');
-    alert('Parse failed: ' + err.message);
+    showToast('Parse failed: ' + err.message, 'error');
   }
 }
 
@@ -104,7 +220,7 @@ document.addEventListener('click', (e) => {
       .map(r => r.input_symbol || r.ticker?.replace(/\.(NS|BO)$/, ''))
       .filter(Boolean);
     if (rejectedSyms.length === 0) {
-      alert('No rejected stocks to browse.');
+      showToast('No rejected stocks to browse.', 'info');
       return;
     }
     startBrowseMode(rejectedSyms);
@@ -135,9 +251,10 @@ document.addEventListener('click', (e) => {
         copyBtn.textContent = `✓ Copied ${syms.length}`;
         copyBtn.disabled = true;
         setTimeout(() => { copyBtn.textContent = orig; copyBtn.disabled = false; }, 1500);
-      }).catch(() => alert('Clipboard write failed'));
+        showToast(`Copied ${syms.length} symbol${syms.length === 1 ? '' : 's'} for TradingView.`, 'success');
+      }).catch(() => showToast('Clipboard write failed.', 'error'));
     } else {
-      alert(tvFormat);
+      showToast('Clipboard not available in this browser.', 'error');
     }
     return;
   }
@@ -148,20 +265,25 @@ document.addEventListener('click', (e) => {
     e.stopPropagation();
     const sectionId = clearBtn.dataset.clearSection;
     const sectionName = clearBtn.dataset.sectionName || 'this section';
-    if (!confirm(`Remove all stocks from "${sectionName}"?\n\nThe section itself will stay; stocks return to their pattern tabs (All / VCP / Bull flag).`)) return;
-    fetch(`/api/sections/${sectionId}/clear`, { method: 'POST' })
-      .then(r => r.json())
-      .then(() => {
-        // Reload assignments and re-render
-        loadCustomSections().then(() => {
-          // If the user is currently viewing this section, switch to All tab
-          if (String(state.activeTab) === String(sectionId)) {
-            state.activeTab = 'all';
-          }
-          sortAndRerender();
-        });
-      })
-      .catch(err => alert('Clear failed: ' + err.message));
+    confirmDialog(
+      'The section itself stays; its stocks return to their pattern tabs (All / VCP / Bull flag).',
+      { title: `Remove all stocks from "${sectionName}"?`, confirmLabel: 'Remove all', danger: true }
+    ).then(ok => {
+      if (!ok) return;
+      fetch(`/api/sections/${sectionId}/clear`, { method: 'POST' })
+        .then(r => r.json())
+        .then(() => {
+          // Reload assignments and re-render
+          loadCustomSections().then(() => {
+            // If the user is currently viewing this section, switch to All tab
+            if (String(state.activeTab) === String(sectionId)) {
+              state.activeTab = 'all';
+            }
+            sortAndRerender();
+          });
+        })
+        .catch(err => showToast('Clear failed: ' + err.message, 'error'));
+    });
     return;
   }
 });
@@ -171,7 +293,7 @@ document.addEventListener('click', (e) => {
 // ---------------------------------------------------------------------------
 async function startBrowseMode(symbols) {
   if (!symbols || symbols.length === 0) {
-    alert('No symbols loaded. Drop a CSV first.');
+    showToast('No symbols loaded. Drop a CSV first.', 'info');
     return;
   }
   state.browseList = symbols.map(s => ({ input_symbol: s, ticker: `${s}.NS` }));
@@ -253,7 +375,7 @@ function augmentModalForBrowse() {
   // Build sections-dropdown options
   const sections = state.customSections || [];
   const sectionOptions = sections.map(s =>
-    `<option value="${s.id}" ${assignedSection?.id === s.id ? 'selected' : ''}>${s.name}</option>`
+    `<option value="${s.id}" ${assignedSection?.id === s.id ? 'selected' : ''}>${esc(s.name)}</option>`
   ).join('');
 
   // Inject a browse-bar at the very top
@@ -262,26 +384,26 @@ function augmentModalForBrowse() {
   bar.id = 'browseBar';
   bar.className = 'browse-bar';
   bar.innerHTML = `
-    <button class="browse-nav-btn" id="browsePrev" title="Previous (←  or  k)" ${idx === 0 ? 'disabled' : ''}>←</button>
+    <button class="browse-nav-btn" id="browsePrev" title="Previous (←  or  k)" ${idx === 0 ? 'disabled' : ''}>${svgIcon('arrowLeft')}</button>
     <div class="browse-progress">
       <span class="browse-pos"><b>${idx + 1}</b>/${total}</span>
       <span class="browse-sym">${sym}</span>
-      ${assignedSection ? `<span class="browse-section-pill" style="--bc:${assignedSection.color}">${assignedSection.name}</span>` : ''}
+      ${assignedSection ? `<span class="browse-section-pill" style="--bc:${assignedSection.color}">${esc(assignedSection.name)}</span>` : ''}
     </div>
     <div class="browse-actions">
       <button class="browse-action skip ${decision === 'skip' ? 'on' : ''}" data-action="skip" title="Skip (s)">Skip</button>
-      <button class="browse-action interested ${decision === 'interested' ? 'on' : ''}" data-action="interested" title="Mark interested (i)">★</button>
+      <button class="browse-action interested ${decision === 'interested' ? 'on' : ''}" data-action="interested" title="Mark interested (i)">${svgIcon('star', 16)}</button>
       <select class="browse-section-select" id="browseSectionSelect" title="Move to section">
         <option value="">Move to…</option>
         ${sectionOptions}
         <option value="__new__">+ New section…</option>
-        ${assignedSection ? `<option value="__remove__">× Remove from "${assignedSection.name}"</option>` : ''}
+        ${assignedSection ? `<option value="__remove__">× Remove from "${esc(assignedSection.name)}"</option>` : ''}
       </select>
-      <button class="browse-icon-btn" id="browseInfoToggle" title="Toggle info panel (key stats, notes, indicators)">ⓘ</button>
-      <button class="browse-icon-btn" id="browseRefresh" title="Refresh chart data from server">↻</button>
+      <button class="browse-icon-btn" id="browseInfoToggle" title="Toggle info panel (key stats, notes, indicators)">${svgIcon('info')}</button>
+      <button class="browse-icon-btn" id="browseRefresh" title="Refresh chart data from server">${svgIcon('refresh')}</button>
     </div>
-    <button class="browse-nav-btn" id="browseNext" title="Next (→  or  j)" ${idx === total - 1 ? 'disabled' : ''}>→</button>
-    <button class="browse-exit-btn" id="browseExit" title="Exit (Esc)">✕</button>
+    <button class="browse-nav-btn" id="browseNext" title="Next (→  or  j)" ${idx === total - 1 ? 'disabled' : ''}>${svgIcon('arrowRight')}</button>
+    <button class="browse-exit-btn" id="browseExit" title="Exit (Esc)">${svgIcon('x')}</button>
   `;
   const modalContent = document.getElementById('modalContent');
   modalContent.insertBefore(bar, modalContent.firstChild);
@@ -359,7 +481,7 @@ function buildBrowseInfoPanel() {
   }
 
   if (r.error) {
-    panel.innerHTML = `<div class="bip-empty">No data — ${r.error}</div>`;
+    panel.innerHTML = `<div class="bip-empty">No data — ${esc(r.error)}</div>`;
     return;
   }
 
@@ -617,10 +739,10 @@ function updateNotifIcon() {
   const icon = $('notifIcon');
   if (!icon) return;
   if (!notifState.enabled || notifState.permission !== 'granted') {
-    icon.textContent = '🔕';
+    icon.innerHTML = svgIcon('bellOff');
     $('notifToggle')?.classList.remove('on');
   } else {
-    icon.textContent = '🔔';
+    icon.innerHTML = svgIcon('bell');
     $('notifToggle')?.classList.add('on');
   }
 }
@@ -632,7 +754,7 @@ async function toggleNotifications() {
   } else {
     const ok = await ensureNotifPermission();
     if (!ok) {
-      alert('Notifications blocked. Enable them in your browser settings to receive alerts.');
+      showToast('Notifications blocked. Enable them in your browser settings to receive alerts.', 'error');
       return;
     }
     notifState.enabled = true;
@@ -725,7 +847,7 @@ function applyTheme(theme) {
     document.body.classList.toggle('theme-dark', theme === 'dark');
   }
   const btn = document.getElementById('themeToggle');
-  if (btn) btn.textContent = theme === 'dark' ? '☀️' : '🌙';
+  if (btn) btn.innerHTML = theme === 'dark' ? svgIcon('sun') : svgIcon('moon');
   // Re-render an open chart with new theme colors — guard against TDZ
   // since this function may be invoked before _activeResult/_activeChart
   // have been declared in the script.
@@ -855,9 +977,9 @@ function sortAndRerender() {
                 ${t.isCustom ? `data-section-id="${t.sectionId}"` : ''}
                 ${t.color ? `style="--tab-color: ${t.color}"` : ''}>
           ${t.isCustom ? `<span class="tab-dot" style="background:${t.color}"></span>` : ''}
-          <span class="tab-label">${t.label}</span>
+          <span class="tab-label">${esc(t.label)}</span>
           ${t.isSectors ? '' : `<span class="tab-count">${t.count}</span>`}
-          ${t.isCustom ? `<button class="tab-edit" data-edit="${t.sectionId}" title="Edit section">⋯</button>` : ''}
+          ${t.isCustom ? `<button class="tab-edit" data-edit="${t.sectionId}" title="Edit section">${svgIcon('more', 15)}</button>` : ''}
         </button>
       `).join('')}
     </div>
@@ -913,12 +1035,12 @@ function sortAndRerender() {
       tabBody.innerHTML = `
         <div class="results-section">
           <div class="section-head">
-            <h3 class="label" style="color:${active.color}">${active.label}</h3>
+            <h3 class="label" style="color:${active.color}">${esc(active.label)}</h3>
             <span class="results-count">${active.count} ${active.count === 1 ? 'stock' : 'stocks'}</span>
             <div class="section-actions">
               <button class="btn-link" data-browse-syms="${csyms}">Browse →</button>
               <button class="btn-link" data-copy-syms="${csyms}" title="Copy symbols (paste into TradingView watchlist)">Copy</button>
-              <button class="btn-link btn-link-danger" data-clear-section="${active.sectionId}" data-section-name="${active.label}" title="Remove all stocks from this section (does not delete the section)">Clear all</button>
+              <button class="btn-link btn-link-danger" data-clear-section="${active.sectionId}" data-section-name="${esc(active.label)}" title="Remove all stocks from this section (does not delete the section)">Clear all</button>
             </div>
           </div>
           <div class="results-grid" data-grid="custom-${active.sectionId}"></div>
@@ -1050,7 +1172,7 @@ function openSectionEditor(sectionId) {
         </h2>
         <div class="hf-field" style="margin-bottom: 1rem">
           <label>Name</label>
-          <input type="text" id="sectionName" value="${existing ? existing.name.replace(/"/g, '&quot;') : ''}" placeholder="e.g. Watching for entry" maxlength="60" autofocus>
+          <input type="text" id="sectionName" value="${existing ? esc(existing.name) : ''}" placeholder="e.g. Watching for entry" maxlength="60" autofocus>
         </div>
         <div class="hf-field" style="margin-bottom: 1.25rem">
           <label>Color</label>
@@ -1082,7 +1204,7 @@ function openSectionEditor(sectionId) {
   overlay.querySelector('#saveSectionBtn').addEventListener('click', async () => {
     const name = overlay.querySelector('#sectionName').value.trim();
     const color = overlay.querySelector('#sectionColor').value;
-    if (!name) { alert('Name required'); return; }
+    if (!name) { showToast('Section name is required.', 'error'); return; }
     try {
       if (existing) {
         await fetch(`/api/sections/${existing.id}`, {
@@ -1100,12 +1222,13 @@ function openSectionEditor(sectionId) {
       await loadCustomSections();
       sortAndRerender();
       cleanup();
-    } catch (e) { alert('Save failed'); }
+      showToast(existing ? 'Section updated.' : 'Section created.', 'success');
+    } catch (e) { showToast('Save failed.', 'error'); }
   });
 
   if (existing) {
     overlay.querySelector('#deleteSectionBtn').addEventListener('click', async () => {
-      if (!confirm(`Delete section "${existing.name}"? Stocks in it will return to their pattern tab.`)) return;
+      if (!(await confirmDialog('Stocks in it will return to their pattern tab.', { title: `Delete section "${existing.name}"?`, confirmLabel: 'Delete', danger: true }))) return;
       await fetch(`/api/sections/${existing.id}`, { method: 'DELETE' });
       if (state.activeTab === `custom-${existing.id}`) state.activeTab = 'all';
       await loadCustomSections();
@@ -1129,7 +1252,7 @@ let _lastSectorData = null;
 
 async function browseSectorTopStocks() {
   if (!_lastSectorData || !_lastSectorData.sectors || _lastSectorData.sectors.length === 0) {
-    alert('Sector data not loaded yet.');
+    showToast('Sector data not loaded yet.', 'info');
     return;
   }
   // Sort sectors by alpha (the same way the UI does), take top 3, collect their stocks
@@ -1145,7 +1268,7 @@ async function browseSectorTopStocks() {
     });
   });
   if (syms.length === 0) {
-    alert('No stocks found in top sectors.');
+    showToast('No stocks found in top sectors.', 'info');
     return;
   }
   startBrowseMode(syms);
@@ -1365,8 +1488,8 @@ function buildCardEl(r) {
     ? state.customSections.find(s => s.id === assignedIds[0])
     : null;
   const sectionBadge = assignedSection
-    ? `<span class="card-section-badge" style="--bc:${assignedSection.color}" title="In section: ${assignedSection.name}">
-         <span class="card-section-dot"></span>${assignedSection.name}
+    ? `<span class="card-section-badge" style="--bc:${assignedSection.color}" title="In section: ${esc(assignedSection.name)}">
+         <span class="card-section-dot"></span>${esc(assignedSection.name)}
        </span>`
     : '';
 
@@ -1386,7 +1509,7 @@ function buildCardEl(r) {
       ${r.atr_ratio != null ? `<span>ATR ratio <b>${r.atr_ratio}</b></span>` : ''}
     </div>
     ${r.notes ? `<div class="card-notes">${r.notes}</div>` : ''}
-    <button class="card-move-btn" title="Move to section">⋯</button>
+    <button class="card-move-btn" title="Move to section">${svgIcon('more', 16)}</button>
   `;
 
   card.addEventListener('click', (e) => {
@@ -1415,7 +1538,7 @@ function openMoveMenu(card, symbol) {
     ${sections.map(s => `
       <button class="move-menu-item ${currentSection === s.id ? 'current' : ''}" data-section-id="${s.id}">
         <span class="move-menu-dot" style="background:${s.color}"></span>
-        ${s.name}
+        ${esc(s.name)}
         ${currentSection === s.id ? '<span class="move-check">✓</span>' : ''}
       </button>
     `).join('')}
@@ -1502,8 +1625,7 @@ function openModal(r) {
         <div class="modal-pattern" style="color:var(--neg)">Error</div>
       </div></div>
       <div class="modal-section">
-        <p>${r.error}</p>
-        ${r.trace ? '<pre style="font-size:0.7rem;color:var(--text-faint);white-space:pre-wrap;margin-top:1rem">'+r.trace+'</pre>' : ''}
+        <p>${esc(r.error)}</p>
       </div>`;
     $('modal').classList.remove('hidden');
     return;
@@ -1545,7 +1667,7 @@ function openModal(r) {
         </div>
         <div class="tb-sep"></div>
         <div class="tb-group" title="VCP structure">
-          <button class="tb-btn vcp-toggle active" data-vcp="on">📐 VCP</button>
+          <button class="tb-btn vcp-toggle active" data-vcp="on">${svgIcon('activity', 14)} VCP</button>
         </div>
         <div class="tb-sep"></div>
         <div class="tb-group" title="Range">
@@ -1846,7 +1968,7 @@ function renderIndicators(r) {
 
   panel.innerHTML = `
     <details class="indicators-details" open>
-      <summary class="ind-summary">📊 Indicators</summary>
+      <summary class="ind-summary">${svgIcon('chart', 15)} Indicators</summary>
       <div class="indicators-grid">
         <div class="ind-card">
           <div class="ind-head">RSI(14)</div>
@@ -2266,7 +2388,7 @@ async function initUserPill() {
 }
 
 document.getElementById('userPill')?.addEventListener('click', async () => {
-  if (!confirm('Sign out?')) return;
+  if (!(await confirmDialog('You can sign back in anytime.', { title: 'Sign out?', confirmLabel: 'Sign out' }))) return;
   try {
     await fetch('/api/auth/logout', { method: 'POST' });
   } finally {
@@ -2347,15 +2469,16 @@ $('holdingForm').addEventListener('submit', async (e) => {
   const qty = parseInt($('hfQty').value, 10);
   if (!sym || !entry || !stop || !qty) return;
   if (stop >= entry) {
-    alert('Stop must be below entry price.');
+    showToast('Stop must be below entry price.', 'error');
     return;
   }
   try {
     await addHolding({ symbol: sym, exchange, entry, stop, qty });
     $('holdingForm').reset();
     await renderHoldings();
+    showToast(`Added ${sym}.`, 'success');
   } catch (err) {
-    alert('Failed: ' + err.message);
+    showToast('Failed: ' + err.message, 'error');
   }
 });
 
@@ -2429,7 +2552,7 @@ function renderHoldingsTable(data) {
         <div class="ht-row" style="opacity:0.6">
           <div><span class="sym">${h.symbol}</span></div>
           <div class="right muted">${(h.entry||0).toLocaleString('en-IN')}</div>
-          <div class="right muted">Error: ${h.error}</div>
+          <div class="right muted">Error: ${esc(h.error)}</div>
           <div></div><div></div><div></div><div></div><div></div>
           <div class="right"><button class="ht-del" data-id="${h.id}">×</button></div>
         </div>`;
@@ -2474,7 +2597,7 @@ function renderHoldingsTable(data) {
   document.querySelectorAll('.ht-del').forEach(btn => {
     btn.addEventListener('click', async (e) => {
       const id = parseInt(e.target.dataset.id, 10);
-      if (!confirm('Remove this position?')) return;
+      if (!(await confirmDialog('This removes it from your open positions. Closed-trade history is unaffected.', { title: 'Remove this position?', confirmLabel: 'Remove', danger: true }))) return;
       await deleteHoldingById(id);
       await renderHoldings();
     });
@@ -2548,7 +2671,7 @@ async function deleteDrawingApi(id) {
 
 async function clearAllDrawings() {
   if (!_drawState.symbol) return;
-  if (!confirm(`Remove all drawings on ${_drawState.symbol}?`)) return;
+  if (!(await confirmDialog('This removes every drawing on this chart and cannot be undone.', { title: `Remove all drawings on ${_drawState.symbol}?`, confirmLabel: 'Remove all', danger: true }))) return;
   await fetch(`/api/drawings/${encodeURIComponent(_drawState.symbol)}/clear`, { method: 'POST' });
   _drawState.drawings = [];
   renderOverlay();
@@ -2743,7 +2866,7 @@ function onOverlayMouseUp(e) {
       const changed = JSON.stringify(before) !== JSON.stringify(drawing.points);
       if (changed) {
         patchDrawing(drawing.id, { points: drawing.points }).catch(err => {
-          alert('Save failed: ' + err.message);
+          showToast('Save failed: ' + err.message, 'error');
           drawing.points = before;
           renderOverlay();
         });
@@ -2771,15 +2894,17 @@ function onOverlayContextMenu(e) {
   const id = e.target?.dataset?.drawId;
   if (!id) return;
   e.preventDefault();
-  if (!confirm('Delete this drawing?')) return;
-  const numId = parseInt(id, 10);
-  deleteDrawingApi(numId).then(() => {
-    _drawState.drawings = _drawState.drawings.filter(d => d.id !== numId);
-    if (_drawState.selectedId === numId) {
-      _drawState.selectedId = null;
-      hideEditPopover();
-    }
-    renderOverlay();
+  confirmDialog('', { title: 'Delete this drawing?', confirmLabel: 'Delete', danger: true }).then(ok => {
+    if (!ok) return;
+    const numId = parseInt(id, 10);
+    deleteDrawingApi(numId).then(() => {
+      _drawState.drawings = _drawState.drawings.filter(d => d.id !== numId);
+      if (_drawState.selectedId === numId) {
+        _drawState.selectedId = null;
+        hideEditPopover();
+      }
+      renderOverlay();
+    });
   });
 }
 
@@ -2828,17 +2953,17 @@ function showEditPopover(id) {
       hideEditPopover();
       _drawState.selectedId = null;
       renderOverlay();
-    } catch (e) { alert('Save failed: ' + e.message); }
+    } catch (e) { showToast('Save failed: ' + e.message, 'error'); }
   });
   document.getElementById('dpDel').addEventListener('click', async () => {
-    if (!confirm('Delete this drawing?')) return;
+    if (!(await confirmDialog('', { title: 'Delete this drawing?', confirmLabel: 'Delete', danger: true }))) return;
     try {
       await deleteDrawingApi(id);
       _drawState.drawings = _drawState.drawings.filter(d => d.id !== id);
       _drawState.selectedId = null;
       hideEditPopover();
       renderOverlay();
-    } catch (e) { alert('Delete failed: ' + e.message); }
+    } catch (e) { showToast('Delete failed: ' + e.message, 'error'); }
   });
 }
 
@@ -2877,7 +3002,7 @@ async function commitDraft() {
     _drawState.drawings.push({ id, ...d });
     document.getElementById('drawLabel').value = '';
   } catch (err) {
-    alert('Save drawing failed: ' + err.message);
+    showToast('Save drawing failed: ' + err.message, 'error');
   }
   renderOverlay();
 }
