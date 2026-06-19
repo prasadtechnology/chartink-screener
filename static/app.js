@@ -840,7 +840,8 @@ function detectAndAlertStopHits(holdings) {
 // ---------------------------------------------------------------------------
 const THEME_KEY = 'vcp_theme_v1';
 function getTheme() {
-  return localStorage.getItem(THEME_KEY) === 'dark' ? 'dark' : 'light';
+  // Aurora is dark-first: default to dark unless the user explicitly picked light.
+  return localStorage.getItem(THEME_KEY) === 'light' ? 'light' : 'dark';
 }
 function applyTheme(theme) {
   if (document.body) {
