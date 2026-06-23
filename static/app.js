@@ -1618,6 +1618,10 @@ function closeModal() {
   document.getElementById('browseSidePanel')?.remove();
 }
 
+function fmtRs(v) {
+  return v == null ? '—' : '₹' + Number(v).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
 function openModal(r) {
   if (r.error) {
     $('modalContent').innerHTML = `
@@ -1643,17 +1647,25 @@ function openModal(r) {
   const changeSign = dayChange >= 0 ? '+' : '';
 
   $('modalContent').innerHTML = `
-    <div class="modal-head">
-      <div>
-        <div class="modal-ticker">${r.input_symbol || r.ticker}</div>
-      </div>
+    <div class="modal-head modal-head-compact">
+      <span class="mh-tk">${r.input_symbol || r.ticker}</span>
+      <span class="mh-px">₹${r.current_price?.toLocaleString('en-IN', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</span>
+      <span class="mh-chg ${changeCls}">${changeSign}${dayChange.toFixed(2)} (${changeSign}${dayChangePct.toFixed(2)}%)</span>
+      ${r.pattern ? `<span class="mh-badge">${esc(r.pattern)}${r.score != null ? ` · ${r.score}` : ''}</span>` : ''}
+    </div>
+
+    <div class="trade-strip">
+      <div class="ts"><span class="ts-l">Entry</span><span class="ts-v">${fmtRs(r.entry)}</span></div>
+      <div class="ts"><span class="ts-l">Stop</span><span class="ts-v neg">${fmtRs(r.stop)}${r.risk_pct != null ? ` <i>−${r.risk_pct}%</i>` : ''}</span></div>
+      <div class="ts"><span class="ts-l">Target</span><span class="ts-v pos">${fmtRs(r.target)}</span></div>
+      <div class="ts"><span class="ts-l">R : R</span><span class="ts-v">${r.r_multiple_potential != null ? r.r_multiple_potential + 'R' : '—'}</span></div>
+      <div class="ts"><span class="ts-l">Pivot</span><span class="ts-v">${fmtRs(r.pivot)}</span></div>
+      <div class="ts"><span class="ts-l">From pivot</span><span class="ts-v">${r.pct_from_pivot == null ? '—' : (r.pct_from_pivot < 0 ? `+${(-r.pct_from_pivot).toFixed(2)}% past` : `${r.pct_from_pivot.toFixed(2)}% below`)}</span></div>
+      <div class="ts"><span class="ts-l">ATR ratio</span><span class="ts-v">${r.atr_ratio ?? '—'}</span></div>
+      <div class="ts"><span class="ts-l">52-wk</span><span class="ts-v">${(r.low_52w != null && r.high_52w != null) ? `${Number(r.low_52w).toLocaleString('en-IN')} – ${Number(r.high_52w).toLocaleString('en-IN')}` : '—'}</span></div>
     </div>
 
     <div class="chart-toolbar">
-      <div class="chart-toolbar-left">
-        <span class="tb-price">₹${r.current_price?.toLocaleString('en-IN', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</span>
-        <span class="tb-change ${changeCls}">${changeSign}${dayChange.toFixed(2)} (${changeSign}${dayChangePct.toFixed(2)}%)</span>
-      </div>
       <div class="chart-toolbar-right">
         <div class="tb-group" title="Timeframe">
           <button class="tb-btn" data-tf="1h">1H</button>
@@ -1715,6 +1727,8 @@ function openModal(r) {
       <div class="chart-hint">scroll · zoom &nbsp;·&nbsp; drag · pan &nbsp;·&nbsp; pick a tool above to annotate</div>
     </div>
 
+    <details class="modal-details">
+      <summary>Structure &amp; indicators</summary>
     <div class="indicators-panel" id="indicatorsPanel"></div>
 
     <div class="modal-grid">
@@ -1752,7 +1766,8 @@ function openModal(r) {
       </div>
     </div>
 
-    ${r.notes ? `<div class="modal-section"><h3>Notes</h3><p>${r.notes}</p></div>` : ''}
+    ${r.notes ? `<div class="modal-section"><h3>Notes</h3><p>${esc(r.notes)}</p></div>` : ''}
+    </details>
   `;
   $('modal').classList.remove('hidden');
 
