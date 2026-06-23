@@ -29,7 +29,7 @@
   --amber: #d97706;
   --amber-dim: rgba(217, 119, 6, 0.1);
 
-  --font-display: 'Instrument Serif', Georgia, serif;
+  --font-display: 'Inter Tight', 'Inter', -apple-system, sans-serif;
   --font-sans: 'Inter', -apple-system, 'Helvetica Neue', sans-serif;
   --font-mono: 'JetBrains Mono', 'SF Mono', Menlo, monospace;
 }
@@ -40,6 +40,7 @@ html, body {
   background: var(--bg);
   color: var(--text);
   font-family: var(--font-sans);
+  font-variant-numeric: tabular-nums;
   font-weight: 400;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
