@@ -2434,6 +2434,128 @@ loadCustomSections();
 // ---------------------------------------------------------------------------
 // Top nav: Scan / Holdings
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Trading journal — performance metrics over all closed trades
+// ---------------------------------------------------------------------------
+function jrMoney(v) {
+  const n = Math.round(v || 0);
+  return (n < 0 ? '−₹' : '₹') + Math.abs(n).toLocaleString('en-IN');
+}
+function jrCard(label, value, cls) {
+  return `<div class="jr-card"><span class="jr-card-l">${label}</span><span class="jr-card-v ${cls || ''}">${value}</span></div>`;
+}
+function jrEquitySvg(equity, colors) {
+  if (!equity || equity.length < 2) return '<p class="empty-tab">Need at least 2 closed trades to plot an equity curve.</p>';
+  const w = 900, h = 200, pad = 10, n = equity.length;
+  const vals = equity.map(e => e.pnl);
+  const min = Math.min(0, ...vals), max = Math.max(0, ...vals), range = (max - min) || 1;
+  const X = i => pad + (i / (n - 1)) * (w - 2 * pad);
+  const Y = v => pad + (1 - (v - min) / range) * (h - 2 * pad);
+  const pts = equity.map((e, i) => `${X(i).toFixed(1)},${Y(e.pnl).toFixed(1)}`).join(' ');
+  const area = `M${X(0).toFixed(1)},${Y(min).toFixed(1)} L` +
+    equity.map((e, i) => `${X(i).toFixed(1)},${Y(e.pnl).toFixed(1)}`).join(' L') +
+    ` L${X(n - 1).toFixed(1)},${Y(min).toFixed(1)} Z`;
+  const col = vals[n - 1] >= 0 ? colors.pos : colors.neg;
+  const zeroY = Y(0).toFixed(1);
+  return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" class="jr-eq-svg" role="img" aria-label="Equity curve">
+    <defs><linearGradient id="jreq" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${col}" stop-opacity="0.28"/><stop offset="1" stop-color="${col}" stop-opacity="0"/></linearGradient></defs>
+    <line x1="0" y1="${zeroY}" x2="${w}" y2="${zeroY}" stroke="${colors.border}" stroke-width="1" stroke-dasharray="4 4"/>
+    <path d="${area}" fill="url(#jreq)"/>
+    <polyline points="${pts}" fill="none" stroke="${col}" stroke-width="2"/>
+  </svg>`;
+}
+
+async function renderJournal() {
+  const body = $('journalBody');
+  body.innerHTML = `<p class="empty-tab">Loading…</p>`;
+  let data;
+  try {
+    const res = await fetch('/api/closed_positions');
+    data = await res.json();
+  } catch (e) { body.innerHTML = `<p class="empty-tab">Failed to load: ${esc(e.message)}</p>`; return; }
+
+  const pos = data.positions || [], s = data.stats || {}, monthly = data.monthly || [], equity = data.equity || [];
+  if (!pos.length) {
+    body.innerHTML = `<div class="empty-state"><p>No closed trades yet. Close a position from the <b>Holdings</b> tab and it'll appear here with full performance stats.</p></div>`;
+    return;
+  }
+
+  const cs = getComputedStyle(document.body);
+  const colors = {
+    pos: cs.getPropertyValue('--pos').trim() || '#34d399',
+    neg: cs.getPropertyValue('--neg').trim() || '#fb7185',
+    border: cs.getPropertyValue('--border-strong').trim() || '#444',
+  };
+  const cl = v => (v || 0) >= 0 ? 'pos' : 'neg';
+  const streakTxt = s.current_streak > 0 ? `${s.current_streak}W` : (s.current_streak < 0 ? `${-s.current_streak}L` : '—');
+
+  const cards = [
+    jrCard('Net P&amp;L', jrMoney(s.total_pnl), cl(s.total_pnl)),
+    jrCard('Win rate', `${s.win_rate ?? 0}%`, ''),
+    jrCard('Trades', `${s.total_trades} <i>${s.wins}W · ${s.losses}L</i>`, ''),
+    jrCard('Expectancy', `${s.expectancy_r ?? 0}R`, cl(s.expectancy_r)),
+    jrCard('Avg R : R', `${s.avg_rr ?? 0}R`, cl(s.avg_rr)),
+    jrCard('Profit factor', `${s.profit_factor ?? 0}`, (s.profit_factor >= 1 ? 'pos' : 'neg')),
+    jrCard('Max win streak', `${s.max_win_streak ?? 0}`, 'pos'),
+    jrCard('Max loss streak', `${s.max_loss_streak ?? 0}`, 'neg'),
+    jrCard('Current streak', streakTxt, s.current_streak >= 0 ? 'pos' : 'neg'),
+    jrCard('Max drawdown', jrMoney(-Math.abs(s.max_drawdown || 0)), 'neg'),
+    jrCard('Largest win', jrMoney(s.largest_win), 'pos'),
+    jrCard('Largest loss', jrMoney(s.largest_loss), 'neg'),
+    jrCard('Avg win', `${s.avg_win_r ?? 0}R`, 'pos'),
+    jrCard('Avg loss', `${s.avg_loss_r ?? 0}R`, 'neg'),
+    jrCard('Avg hold', `${s.avg_hold_days ?? 0}d`, ''),
+  ].join('');
+
+  const monthRows = monthly.slice().reverse().map(m => `
+    <div class="jr-mrow">
+      <span class="jr-m">${m.month}</span>
+      <span class="jr-mt">${m.trades} <i>trade${m.trades === 1 ? '' : 's'}</i></span>
+      <span class="jr-mw">${m.win_rate}% win</span>
+      <span class="jr-mp ${cl(m.pnl)}">${jrMoney(m.pnl)}</span>
+    </div>`).join('') || '<p class="empty-tab">—</p>';
+
+  const tradeRows = pos.map(p => {
+    const hold = (p.opened_at && p.closed_at) ? Math.max(0, Math.round((p.closed_at - p.opened_at) / 86400)) : null;
+    const d = p.closed_at ? new Date(p.closed_at * 1000).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: '2-digit' }) : '—';
+    return `<div class="jr-trow">
+      <span class="jr-sym">${esc(p.symbol)}</span>
+      <span class="right muted">₹${(p.entry || 0).toLocaleString('en-IN')} → ₹${(p.exit || 0).toLocaleString('en-IN')}</span>
+      <span class="right muted">${p.qty}</span>
+      <span class="right ${cl(p.pnl)}">${jrMoney(p.pnl)}</span>
+      <span class="right ${cl(p.r_multiple)}">${(p.r_multiple || 0).toFixed(2)}R</span>
+      <span class="right muted">${hold != null ? hold + 'd' : '—'}</span>
+      <span class="right muted">${d}</span>
+    </div>`;
+  }).join('');
+
+  body.innerHTML = `
+    <div class="jr-cards">${cards}</div>
+
+    <section class="jr-section">
+      <div class="section-head"><h3 class="label">Equity curve</h3><span class="jr-sub">cumulative P&amp;L · ${s.total_trades} trades</span></div>
+      <div class="jr-eq">${jrEquitySvg(equity, colors)}</div>
+    </section>
+
+    <div class="jr-split">
+      <section class="jr-section">
+        <div class="section-head"><h3 class="label">By month</h3></div>
+        <div class="jr-months">${monthRows}</div>
+      </section>
+      <section class="jr-section">
+        <div class="section-head"><h3 class="label">Closed trades</h3><span class="jr-sub">${pos.length}</span></div>
+        <div class="jr-table">
+          <div class="jr-thead">
+            <span>Symbol</span><span class="right">Entry → Exit</span><span class="right">Qty</span>
+            <span class="right">P&amp;L</span><span class="right">R</span><span class="right">Hold</span><span class="right">Closed</span>
+          </div>
+          ${tradeRows}
+        </div>
+      </section>
+    </div>
+  `;
+}
+
 document.querySelectorAll('.nav-tab').forEach(t => {
   t.addEventListener('click', () => {
     document.querySelectorAll('.nav-tab').forEach(x => x.classList.remove('active'));
@@ -2441,7 +2563,9 @@ document.querySelectorAll('.nav-tab').forEach(t => {
     const view = t.dataset.view;
     $('scanView').classList.toggle('hidden', view !== 'scan');
     $('holdingsView').classList.toggle('hidden', view !== 'holdings');
+    $('journalView').classList.toggle('hidden', view !== 'journal');
     if (view === 'holdings') renderHoldings();
+    if (view === 'journal') renderJournal();
   });
 });
 

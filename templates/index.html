@@ -23,6 +23,7 @@
   <nav class="main-nav">
     <button class="nav-tab active" data-view="scan">Scan</button>
     <button class="nav-tab" data-view="holdings">Holdings <span class="nav-count" id="navHoldingsCount">0</span></button>
+    <button class="nav-tab" data-view="journal">Journal</button>
   </nav>
   <div class="header-meta">
     <span class="status-dot" id="statusDot"></span>
@@ -228,6 +229,15 @@
     <div class="holdings-table hidden" id="holdingsTable"></div>
   </section>
 
+</div>
+
+<!-- ================= JOURNAL VIEW ================= -->
+<div class="view hidden" id="journalView">
+  <section class="page-intro">
+    <h1 class="page-title">Journal</h1>
+    <p class="page-sub">Performance across every closed trade — win rate, expectancy, streaks, drawdown and more.</p>
+  </section>
+  <div id="journalBody"></div>
 </div>
 
 </main>

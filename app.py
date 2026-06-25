@@ -433,29 +433,114 @@ def holdings_close(holding_id):
     return jsonify({'ok': True, **result})
 
 
+def compute_journal_stats(rows):
+    """Rich trading-journal metrics from closed positions.
+
+    Returns {'stats': {...}, 'monthly': [...], 'equity': [...]}. `equity` is the
+    running cumulative P&L (for an equity curve); `monthly` is chronological.
+    """
+    import datetime as _dt
+    if not rows:
+        return {'stats': {}, 'monthly': [], 'equity': []}
+
+    chrono = sorted(rows, key=lambda r: (r.get('closed_at') or 0))
+    n = len(chrono)
+    wins = [r for r in chrono if r['pnl'] > 0]
+    losses = [r for r in chrono if r['pnl'] < 0]
+    gross_profit = sum(r['pnl'] for r in wins)
+    gross_loss = -sum(r['pnl'] for r in losses)          # positive magnitude
+    total_pnl = sum(r['pnl'] for r in chrono)
+    win_rate = len(wins) / n * 100
+    avg_win_r = sum(r['r_multiple'] for r in wins) / len(wins) if wins else 0
+    avg_loss_r = sum(r['r_multiple'] for r in losses) / len(losses) if losses else 0
+    avg_rr = sum(r['r_multiple'] for r in chrono) / n
+    expectancy = (len(wins) / n) * avg_win_r + (len(losses) / n) * avg_loss_r
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (gross_profit if gross_profit else 0)
+
+    # Max consecutive win / loss streaks (chronological)
+    max_win_streak = max_loss_streak = cur_w = cur_l = 0
+    for r in chrono:
+        if r['pnl'] > 0:
+            cur_w += 1; cur_l = 0
+        elif r['pnl'] < 0:
+            cur_l += 1; cur_w = 0
+        else:
+            cur_w = cur_l = 0
+        max_win_streak = max(max_win_streak, cur_w)
+        max_loss_streak = max(max_loss_streak, cur_l)
+
+    # Current streak: +k for k wins, -k for k losses
+    current_streak = 0
+    sign = 1 if chrono[-1]['pnl'] > 0 else (-1 if chrono[-1]['pnl'] < 0 else 0)
+    if sign:
+        for r in reversed(chrono):
+            s = 1 if r['pnl'] > 0 else (-1 if r['pnl'] < 0 else 0)
+            if s == sign:
+                current_streak += 1
+            else:
+                break
+        current_streak *= sign
+
+    # Equity curve + max drawdown (peak-to-trough of cumulative P&L)
+    cum = peak = max_dd = 0.0
+    equity = []
+    for r in chrono:
+        cum += r['pnl']
+        peak = max(peak, cum)
+        max_dd = max(max_dd, peak - cum)
+        equity.append({'pnl': round(cum, 2), 't': r.get('closed_at'), 'symbol': r.get('symbol')})
+
+    holds = [(r['closed_at'] - r['opened_at']) / 86400
+             for r in chrono if r.get('opened_at') and r.get('closed_at')]
+    avg_hold_days = sum(holds) / len(holds) if holds else 0
+
+    # Monthly breakdown
+    months = {}
+    for r in chrono:
+        ts = r.get('closed_at')
+        if not ts:
+            continue
+        key = _dt.datetime.fromtimestamp(ts, _dt.timezone.utc).strftime('%Y-%m')
+        m = months.setdefault(key, {'month': key, 'trades': 0, 'wins': 0, 'pnl': 0.0})
+        m['trades'] += 1
+        m['wins'] += 1 if r['pnl'] > 0 else 0
+        m['pnl'] += r['pnl']
+    monthly = [{
+        'month': m['month'], 'trades': m['trades'], 'wins': m['wins'],
+        'win_rate': round(m['wins'] / m['trades'] * 100, 1) if m['trades'] else 0,
+        'pnl': round(m['pnl'], 2),
+    } for m in months.values()]
+
+    stats = {
+        'total_trades': n, 'wins': len(wins), 'losses': len(losses),
+        'win_rate': round(win_rate, 1), 'loss_rate': round(len(losses) / n * 100, 1),
+        'total_pnl': round(total_pnl, 2),
+        'gross_profit': round(gross_profit, 2), 'gross_loss': round(gross_loss, 2),
+        'profit_factor': round(profit_factor, 2),
+        'avg_win_r': round(avg_win_r, 2), 'avg_loss_r': round(avg_loss_r, 2),
+        'avg_rr': round(avg_rr, 2), 'expectancy_r': round(expectancy, 2),
+        'largest_win': round(max((r['pnl'] for r in chrono), default=0), 2),
+        'largest_loss': round(min((r['pnl'] for r in chrono), default=0), 2),
+        'best_r': round(max((r['r_multiple'] for r in chrono), default=0), 2),
+        'worst_r': round(min((r['r_multiple'] for r in chrono), default=0), 2),
+        'max_win_streak': max_win_streak, 'max_loss_streak': max_loss_streak,
+        'current_streak': current_streak,
+        'max_drawdown': round(max_dd, 2),
+        'avg_hold_days': round(avg_hold_days, 1),
+    }
+    return {'stats': stats, 'monthly': monthly, 'equity': equity}
+
+
 @app.route('/api/closed_positions', methods=['GET'])
 @login_required
 def closed_positions_list():
-    rows = db.list_closed_positions(current_user_id(), limit=500)
-    if not rows:
-        return jsonify({'positions': [], 'stats': {}})
-    wins = [r for r in rows if r['pnl'] > 0]
-    losses = [r for r in rows if r['pnl'] <= 0]
-    avg_win_r = sum(r['r_multiple'] for r in wins) / len(wins) if wins else 0
-    avg_loss_r = sum(r['r_multiple'] for r in losses) / len(losses) if losses else 0
-    win_rate = (len(wins) / len(rows)) * 100 if rows else 0
-    expectancy = (win_rate / 100) * avg_win_r + (1 - win_rate / 100) * avg_loss_r
-    total_pnl = sum(r['pnl'] for r in rows)
+    rows = db.list_closed_positions(current_user_id(), limit=2000)
+    j = compute_journal_stats(rows)
     return jsonify({
         'positions': rows,
-        'stats': {
-            'total_trades': len(rows), 'wins': len(wins), 'losses': len(losses),
-            'win_rate': round(win_rate, 1),
-            'avg_win_r': round(avg_win_r, 2),
-            'avg_loss_r': round(avg_loss_r, 2),
-            'expectancy_r': round(expectancy, 2),
-            'total_pnl': round(total_pnl, 2),
-        }
+        'stats': j['stats'],
+        'monthly': j['monthly'],
+        'equity': j['equity'],
     })
 
 
