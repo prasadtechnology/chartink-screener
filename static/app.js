@@ -2595,6 +2595,54 @@ async function deleteHoldingById(id) {
   await fetch(`/api/holdings/${id}`, { method: 'DELETE' });
 }
 
+// Prompt for an exit price (with a live P&L / R preview) to close a position.
+// Resolves to the exit price, or null if cancelled.
+function closeHoldingPrompt(h) {
+  return new Promise((resolve) => {
+    const entry = Number(h.entry) || 0, stop = Number(h.stop) || 0, qty = Number(h.qty) || 0;
+    const def = (h.cmp != null ? h.cmp : entry) || '';
+    const back = document.createElement('div');
+    back.className = 'confirm-backdrop';
+    back.innerHTML = `
+      <div class="confirm-box">
+        <h3 class="confirm-title">Close ${esc(h.symbol || 'position')}</h3>
+        <p class="confirm-msg">Enter the exit price — this records the trade in your journal.</p>
+        <label class="close-field">Exit price
+          <input type="number" id="closeExit" step="0.01" inputmode="decimal" value="${def}">
+        </label>
+        <div class="close-preview" id="closePrev"></div>
+        <div class="confirm-actions">
+          <button type="button" id="closeCancel">Cancel</button>
+          <button type="button" id="closeOk" class="btn-primary">Close trade</button>
+        </div>
+      </div>`;
+    document.body.appendChild(back);
+    const input = back.querySelector('#closeExit');
+    const prev = back.querySelector('#closePrev');
+    const ok = back.querySelector('#closeOk');
+    function upd() {
+      const ex = parseFloat(input.value);
+      if (!ex || ex <= 0) { prev.innerHTML = ''; ok.disabled = true; return; }
+      ok.disabled = false;
+      const pnl = (ex - entry) * qty;
+      const rps = entry - stop;
+      const r = rps > 0 ? (ex - entry) / rps : 0;
+      prev.innerHTML = `P&amp;L <b class="${pnl >= 0 ? 'pos' : 'neg'}">${(pnl < 0 ? '−₹' : '₹') + Math.abs(Math.round(pnl)).toLocaleString('en-IN')}</b> &nbsp;·&nbsp; <b class="${r >= 0 ? 'pos' : 'neg'}">${r.toFixed(2)}R</b>`;
+    }
+    input.addEventListener('input', upd); upd();
+    function cleanup(v) { back.remove(); document.removeEventListener('keydown', onKey, true); resolve(v); }
+    const onKey = (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); cleanup(null); }
+      else if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); const v = parseFloat(input.value); if (v > 0) cleanup(v); }
+    };
+    back.querySelector('#closeCancel').addEventListener('click', () => cleanup(null));
+    ok.addEventListener('click', () => { const v = parseFloat(input.value); if (v > 0) cleanup(v); });
+    back.addEventListener('mousedown', (e) => { if (e.target === back) cleanup(null); });
+    document.addEventListener('keydown', onKey, true);
+    setTimeout(() => { input.focus(); input.select(); }, 30);
+  });
+}
+
 async function refreshNavCount() {
   const arr = await fetchHoldingsRaw();
   $('navHoldingsCount').textContent = arr.length;
@@ -2694,7 +2742,10 @@ function renderHoldingsTable(data) {
           <div class="right muted">${(h.entry||0).toLocaleString('en-IN')}</div>
           <div class="right muted">Error: ${esc(h.error)}</div>
           <div></div><div></div><div></div><div></div><div></div>
-          <div class="right"><button class="ht-del" data-id="${h.id}">×</button></div>
+          <div class="right ht-actions">
+            <button class="ht-close" data-id="${h.id}" title="Close position — records it to your journal">Close</button>
+            <button class="ht-del" data-id="${h.id}" title="Remove (discard, no journal entry)">×</button>
+          </div>
         </div>`;
     }
     const pnlCls = (h.pnl || 0) >= 0 ? 'ht-pos' : 'ht-neg';
@@ -2715,7 +2766,10 @@ function renderHoldingsTable(data) {
         <div class="right ${pnlCls}">${pnlSign}${(h.pnl_pct||0).toFixed(2)}%</div>
         <div class="right ht-neg">₹${Math.round(h.open_risk||0).toLocaleString('en-IN')}</div>
         <div class="right ${rCls}">${rSign}${(h.r_multiple||0).toFixed(2)}R</div>
-        <div class="right"><button class="ht-del" data-id="${h.id}" title="Remove">×</button></div>
+        <div class="right ht-actions">
+          <button class="ht-close" data-id="${h.id}" title="Close position — records it to your journal">Close</button>
+          <button class="ht-del" data-id="${h.id}" title="Remove (discard, no journal entry)">×</button>
+        </div>
       </div>`;
   }).join('');
 
@@ -2740,6 +2794,27 @@ function renderHoldingsTable(data) {
       if (!(await confirmDialog('This removes it from your open positions. Closed-trade history is unaffected.', { title: 'Remove this position?', confirmLabel: 'Remove', danger: true }))) return;
       await deleteHoldingById(id);
       await renderHoldings();
+    });
+  });
+
+  document.querySelectorAll('.ht-close').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      const id = parseInt(e.currentTarget.dataset.id, 10);
+      const h = rows.find(x => x.id === id) || {};
+      const exit = await closeHoldingPrompt(h);
+      if (exit == null) return;
+      try {
+        const res = await fetch(`/api/holdings/${id}/close`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ exit_price: exit }),
+        });
+        const j = await res.json();
+        if (!res.ok) throw new Error(j.error || 'Close failed');
+        const sign = (j.pnl || 0) >= 0 ? '+' : '−';
+        showToast(`Closed ${h.symbol || ''} · ${sign}₹${Math.abs(Math.round(j.pnl || 0)).toLocaleString('en-IN')} (${(j.r_multiple || 0).toFixed(2)}R) — saved to journal`, (j.pnl || 0) >= 0 ? 'success' : 'info');
+        await renderHoldings();
+        refreshNavCount();
+      } catch (err) { showToast('Close failed: ' + err.message, 'error'); }
     });
   });
 }
