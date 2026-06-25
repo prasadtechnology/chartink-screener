@@ -2526,6 +2526,7 @@ async function renderJournal() {
       <span class="right ${cl(p.r_multiple)}">${(p.r_multiple || 0).toFixed(2)}R</span>
       <span class="right muted">${hold != null ? hold + 'd' : '—'}</span>
       <span class="right muted">${d}</span>
+      <span class="right"><button class="jr-del" data-id="${p.id}" title="Delete this trade">×</button></span>
     </div>`;
   }).join('');
 
@@ -2543,17 +2544,40 @@ async function renderJournal() {
         <div class="jr-months">${monthRows}</div>
       </section>
       <section class="jr-section">
-        <div class="section-head"><h3 class="label">Closed trades</h3><span class="jr-sub">${pos.length}</span></div>
+        <div class="section-head"><h3 class="label">Closed trades</h3><span class="jr-sub">${pos.length}</span><button class="btn-link btn-link-danger" id="jrClearAll">Clear journal</button></div>
         <div class="jr-table">
           <div class="jr-thead">
             <span>Symbol</span><span class="right">Entry → Exit</span><span class="right">Qty</span>
-            <span class="right">P&amp;L</span><span class="right">R</span><span class="right">Hold</span><span class="right">Closed</span>
+            <span class="right">P&amp;L</span><span class="right">R</span><span class="right">Hold</span><span class="right">Closed</span><span></span>
           </div>
           ${tradeRows}
         </div>
       </section>
     </div>
   `;
+
+  $('jrClearAll')?.addEventListener('click', async () => {
+    if (!(await confirmDialog(`This permanently deletes all ${pos.length} closed trade${pos.length === 1 ? '' : 's'}. This can't be undone.`, { title: 'Clear journal?', confirmLabel: 'Clear journal', danger: true }))) return;
+    try {
+      const r = await fetch('/api/closed_positions', { method: 'DELETE' });
+      if (!r.ok) throw new Error('request failed');
+      showToast('Journal cleared.', 'success');
+      renderJournal();
+    } catch (err) { showToast('Clear failed: ' + err.message, 'error'); }
+  });
+
+  document.querySelectorAll('.jr-del').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      const id = parseInt(e.currentTarget.dataset.id, 10);
+      if (!(await confirmDialog('Remove this trade from the journal?', { title: 'Delete trade?', confirmLabel: 'Delete', danger: true }))) return;
+      try {
+        const r = await fetch(`/api/closed_positions/${id}`, { method: 'DELETE' });
+        if (!r.ok) throw new Error('request failed');
+        showToast('Trade deleted.', 'success');
+        renderJournal();
+      } catch (err) { showToast('Delete failed: ' + err.message, 'error'); }
+    });
+  });
 }
 
 document.querySelectorAll('.nav-tab').forEach(t => {

@@ -485,6 +485,22 @@ def list_closed_positions(user_id, limit=200):
         return [dict(r) for r in rows]
 
 
+def delete_closed_position(user_id, id_):
+    with get_conn() as conn:
+        cur = conn.execute(
+            'DELETE FROM closed_positions WHERE id = ? AND user_id = ?', (id_, user_id)
+        )
+        return cur.rowcount > 0
+
+
+def clear_closed_positions(user_id):
+    with get_conn() as conn:
+        cur = conn.execute(
+            'DELETE FROM closed_positions WHERE user_id = ?', (user_id,)
+        )
+        return cur.rowcount
+
+
 if __name__ == '__main__':
     init_db()
     print(f'DB initialised at {DB_PATH}')

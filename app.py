@@ -544,6 +544,22 @@ def closed_positions_list():
     })
 
 
+@app.route('/api/closed_positions/<int:pos_id>', methods=['DELETE'])
+@login_required
+def closed_position_delete(pos_id):
+    ok = db.delete_closed_position(current_user_id(), pos_id)
+    if not ok:
+        return jsonify({'error': 'not_found'}), 404
+    return jsonify({'ok': True})
+
+
+@app.route('/api/closed_positions', methods=['DELETE'])
+@login_required
+def closed_positions_clear():
+    n = db.clear_closed_positions(current_user_id())
+    return jsonify({'ok': True, 'cleared': n})
+
+
 @app.route('/api/holdings_refresh', methods=['POST'])
 @login_required
 def holdings_refresh():
