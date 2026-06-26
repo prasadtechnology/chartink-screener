@@ -1275,8 +1275,8 @@ async function browseSectorTopStocks() {
   startBrowseMode(syms);
 }
 
-async function loadSectorLeaders(forceRefresh = false) {
-  const grid = document.getElementById('sectorLeadersGrid');
+async function loadSectorLeaders(forceRefresh = false, gridEl = null) {
+  const grid = gridEl || document.getElementById('sectorLeadersGrid');
   if (!grid) return;
   const lookback = getSectorLookback();
   grid.innerHTML = forceRefresh
@@ -2580,16 +2580,53 @@ async function renderJournal() {
   });
 }
 
+// Standalone Sectors view (top-nav) — same sector-strength UI, no CSV required.
+function renderSectorsView() {
+  const body = $('sectorsBody');
+  if (body.dataset.ready === '1') return;   // build + fetch once; Refresh re-fetches
+  const lb = getSectorLookback();
+  const lbOptions = [{ val: 5, label: '1W' }, { val: 21, label: '1M' }, { val: 63, label: '3M' }, { val: 126, label: '6M' }, { val: 252, label: '1Y' }];
+  body.innerHTML = `
+    <div class="results-section">
+      <div class="section-head">
+        <h3 class="label">Sector Leaders</h3>
+        <div class="sl-controls">
+          <div class="sl-lookback-group" role="tablist" aria-label="Lookback">
+            ${lbOptions.map(o => `<button class="sl-lb-btn ${o.val === lb ? 'active' : ''}" data-lb="${o.val}">${o.label}</button>`).join('')}
+          </div>
+          <button class="btn-link" id="refreshSectorsTop">Refresh</button>
+          <button class="btn-link-action" id="browseSectorTopBtnTop" title="Browse all stocks in the top 3 sectors">Browse top 3 →</button>
+        </div>
+      </div>
+      <p class="section-sub">Sectors ranked by relative strength vs Nifty. Click any sector to expand its top stocks; click any stock to open its chart.</p>
+      <div id="sectorLeadersGridTop" class="sector-leaders-grid"><p class="empty-tab">Loading sector data…</p></div>
+    </div>`;
+  const grid = body.querySelector('#sectorLeadersGridTop');
+  loadSectorLeaders(false, grid);
+  body.querySelector('#refreshSectorsTop').addEventListener('click', () => loadSectorLeaders(true, grid));
+  body.querySelectorAll('.sl-lb-btn').forEach(b => {
+    b.addEventListener('click', () => {
+      setSectorLookback(parseInt(b.dataset.lb, 10));
+      body.querySelectorAll('.sl-lb-btn').forEach(x => x.classList.toggle('active', x === b));
+      loadSectorLeaders(false, grid);
+    });
+  });
+  body.querySelector('#browseSectorTopBtnTop').addEventListener('click', browseSectorTopStocks);
+  body.dataset.ready = '1';
+}
+
 document.querySelectorAll('.nav-tab').forEach(t => {
   t.addEventListener('click', () => {
     document.querySelectorAll('.nav-tab').forEach(x => x.classList.remove('active'));
     t.classList.add('active');
     const view = t.dataset.view;
     $('scanView').classList.toggle('hidden', view !== 'scan');
+    $('sectorsView').classList.toggle('hidden', view !== 'sectors');
     $('holdingsView').classList.toggle('hidden', view !== 'holdings');
     $('journalView').classList.toggle('hidden', view !== 'journal');
     if (view === 'holdings') renderHoldings();
     if (view === 'journal') renderJournal();
+    if (view === 'sectors') renderSectorsView();
   });
 });
 
