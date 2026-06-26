@@ -953,17 +953,17 @@ function sortAndRerender() {
   ];
 
   // Custom sections — fetched separately and merged
-  const customTabs = (state.customSections || []).map(s => ({
-    id: `custom-${s.id}`,
-    label: s.name,
-    color: s.color,
-    sectionId: s.id,
-    isCustom: true,
-    items: passing.filter(r => {
-      const symAssigns = state.assignments?.[r.input_symbol] || [];
-      return symAssigns.includes(s.id);
-    }),
-  })).map(t => ({ ...t, count: t.items.length }));
+  // A section is a persistent collection: show every symbol assigned to it, not
+  // just ones in the current scan. Use full scan data when we have it (passing
+  // OR rejected); otherwise render a stub and enrich it from the cached screener.
+  const bySymbol = {};
+  state.results.forEach(r => { if (r.input_symbol) bySymbol[r.input_symbol] = r; });
+  const customTabs = (state.customSections || []).map(s => {
+    const syms = Object.keys(state.assignments || {}).filter(
+      sym => (state.assignments[sym] || []).includes(s.id));
+    const items = syms.map(sym => bySymbol[sym] || { input_symbol: sym, ticker: `${sym}.NS`, _stub: true });
+    return { id: `custom-${s.id}`, label: s.name, color: s.color, sectionId: s.id, isCustom: true, items, count: items.length };
+  });
 
   const allTabs = [...tabs, ...customTabs];
 
@@ -1121,7 +1121,7 @@ function sortAndRerender() {
     tabBody.querySelector('#browseSectorTopBtn')?.addEventListener('click', browseSectorTopStocks);
   } else if (active.isCustom) {
     const grid = tabBody.querySelector(`[data-grid="custom-${active.sectionId}"]`);
-    if (grid) active.items.forEach(r => grid.appendChild(buildCardEl(r)));
+    if (grid) renderCustomCards(active.items, grid);
   } else {
     const breakoutsGrid = tabBody.querySelector(`[data-grid="breakouts-${active.id}"]`);
     if (breakoutsGrid) breakouts.forEach(r => breakoutsGrid.appendChild(buildCardEl(r)));
@@ -1580,6 +1580,28 @@ function openMoveMenu(card, symbol) {
 }
 
 function cssId(s) { return (s || '').replace(/[^a-zA-Z0-9]/g, '_'); }
+
+// Render a custom section's cards. Symbols already in the scan render at once;
+// symbols that aren't (after a reload, or rejected stocks) render as a stub and
+// get filled in from the cached screener so the section always shows everything.
+async function renderCustomCards(items, grid) {
+  grid.innerHTML = '';
+  items.forEach(r => grid.appendChild(buildCardEl(r)));
+  for (const r of items.filter(x => x._stub)) {
+    try {
+      const res = await fetch('/api/screen_one', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ symbol: r.input_symbol }),
+      });
+      const full = await res.json();
+      if (!full || full.error) continue;
+      full.input_symbol = r.input_symbol;
+      if (!state.results.some(x => x.input_symbol === full.input_symbol)) state.results.push(full);
+      const ph = Array.from(grid.children).find(c => c.dataset.symbol === r.input_symbol);
+      if (ph) ph.replaceWith(buildCardEl(full));
+    } catch (e) { /* keep the stub card */ }
+  }
+}
 
 function fromPivotText(r) {
   if (r.pct_from_pivot == null) return '';
