@@ -3153,3 +3153,94 @@ body:not(.theme-dark) .site-header { border-bottom-color: transparent; box-shado
 .kite-pill:hover { background: var(--accent); color: #fff; }
 .kite-pill.connected,
 .kite-pill.connected:hover { color: var(--pos); background: var(--pos-dim); border-color: var(--pos); cursor: default; }
+
+/* ============================================================
+   THEMES — selectable via the header swatch. Light: Gemini (:root,
+   default), Teal, Paper. Dark: Aurora (.theme-dark base), Amber.
+   Each overrides only what differs from its base.
+   ============================================================ */
+
+/* Teal (light) */
+body[data-theme="teal"] {
+  --bg: #f6fbfb;
+  --bg-elev-2: #eef5f4;
+  --bg-muted: #ecf4f3;
+  --accent: #0f9b8e;
+  --accent-hover: #0c857a;
+  --accent-2: #22b8a6;
+  --accent-dim: rgba(15, 155, 142, 0.10);
+  --accent-line: rgba(15, 155, 142, 0.32);
+  --grad-accent: linear-gradient(135deg, #0f9b8e, #22b8a6);
+  --glow-accent: 0 6px 18px rgba(15, 155, 142, 0.22);
+  --glow-hover: 0 12px 28px rgba(15, 155, 142, 0.30);
+  --aurora-1: rgba(20, 184, 166, 0.26);
+  --aurora-2: rgba(120, 170, 255, 0.16);
+}
+
+/* Paper (light, warm) */
+body[data-theme="paper"] {
+  --bg: #f7f4ec;
+  --bg-elev: #fffdf7;
+  --bg-elev-2: #f1ece0;
+  --bg-card: #fffdf7;
+  --bg-muted: #efe9da;
+  --border: rgba(60, 50, 30, 0.10);
+  --border-strong: rgba(60, 50, 30, 0.18);
+  --text: #2a2519;
+  --text-dim: #6b6555;
+  --text-faint: #9a9282;
+  --accent: #b5740f;
+  --accent-hover: #9c6109;
+  --accent-2: #d4943a;
+  --accent-dim: rgba(181, 116, 15, 0.10);
+  --accent-line: rgba(181, 116, 15, 0.32);
+  --grad-accent: linear-gradient(135deg, #b5740f, #d4943a);
+  --glow-accent: 0 6px 18px rgba(181, 116, 15, 0.18);
+  --glow-hover: 0 12px 28px rgba(181, 116, 15, 0.24);
+  --aurora-1: rgba(210, 170, 90, 0.20);
+  --aurora-2: rgba(190, 150, 110, 0.16);
+}
+
+/* Amber (dark) — overrides the Aurora dark base */
+body.theme-dark[data-theme="amber"] {
+  --bg: #0e0d0b;
+  --bg-elev: #16140f;
+  --bg-elev-2: #1f1b13;
+  --bg-card: #14120d;
+  --bg-muted: #211d14;
+  --border: rgba(240, 230, 200, 0.09);
+  --border-strong: rgba(240, 230, 200, 0.18);
+  --accent: #e0a325;
+  --accent-hover: #f0b53a;
+  --accent-2: #d4943a;
+  --accent-dim: rgba(224, 163, 37, 0.12);
+  --accent-line: rgba(224, 163, 37, 0.34);
+  --grad-accent: linear-gradient(135deg, #e0a325, #d4943a);
+  --glow-accent: 0 6px 22px rgba(224, 163, 37, 0.38);
+  --glow-hover: 0 12px 30px rgba(224, 163, 37, 0.50);
+  --aurora-1: rgba(224, 163, 37, 0.34);
+  --aurora-2: rgba(180, 120, 30, 0.24);
+  --card-surface: linear-gradient(180deg, rgba(255, 240, 210, 0.05), rgba(255, 240, 210, 0.012));
+}
+
+/* Theme picker swatch + menu */
+.theme-dot { width: 14px; height: 14px; border-radius: 50%; display: inline-block; }
+.theme-menu {
+  position: fixed; z-index: 300;
+  background: var(--bg-elev); border: 1px solid var(--border-strong);
+  border-radius: 12px; padding: 6px; min-width: 190px;
+  box-shadow: var(--shadow-hover, 0 14px 36px rgba(0, 0, 0, 0.2));
+}
+.theme-menu .tm-head { font-size: 0.64rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--text-faint); padding: 6px 10px 5px; }
+.theme-menu .tm-item {
+  display: flex; align-items: center; gap: 10px; width: 100%;
+  background: transparent; border: none; cursor: pointer;
+  padding: 8px 10px; border-radius: 8px; color: var(--text);
+  font-family: var(--font-sans); font-size: 0.85rem; text-align: left;
+}
+.theme-menu .tm-item:hover { background: var(--bg-muted); }
+.theme-menu .tm-item.on { background: var(--accent-dim); }
+.theme-menu .tm-dot { width: 15px; height: 15px; border-radius: 50%; flex: 0 0 auto; box-shadow: 0 0 0 2px var(--bg-elev), 0 0 0 3px var(--border); }
+.theme-menu .tm-label { flex: 1; font-weight: 500; }
+.theme-menu .tm-mode { font-size: 0.64rem; color: var(--text-faint); font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.04em; }
+.theme-menu .tm-item .icon { color: var(--accent); }

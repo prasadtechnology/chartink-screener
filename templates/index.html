@@ -11,7 +11,7 @@
 <script src="{{ url_for('static', filename='lightweight-charts.standalone.production.js') }}"></script>
 </head>
 <body>
-<script>try{if(localStorage.getItem('vcp_theme_v1')==='dark')document.body.classList.add('theme-dark');}catch(e){}</script>
+<script>try{var v=localStorage.getItem('vcp_theme_v1');if(v==='light')v='gemini';if(v==='dark')v='aurora';var D={gemini:0,teal:0,paper:0,aurora:1,amber:1};if(!(v in D))v='gemini';document.body.dataset.theme=v;if(D[v])document.body.classList.add('theme-dark');}catch(e){}</script>
 
 <div class="bg-grid"></div>
 

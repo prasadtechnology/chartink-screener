@@ -839,19 +839,35 @@ function detectAndAlertStopHits(holdings) {
 // Theme: light / dark, persisted in localStorage
 // ---------------------------------------------------------------------------
 const THEME_KEY = 'vcp_theme_v1';
+const THEMES = [
+  { id: 'gemini', label: 'Gemini', dark: false, sw: '#2f6df6' },
+  { id: 'teal',   label: 'Teal',   dark: false, sw: '#0f9b8e' },
+  { id: 'paper',  label: 'Paper',  dark: false, sw: '#b5740f' },
+  { id: 'aurora', label: 'Aurora', dark: true,  sw: '#8b93ff' },
+  { id: 'amber',  label: 'Amber',  dark: true,  sw: '#e0a325' },
+];
+const THEME_IDS = THEMES.map(t => t.id);
+
 function getTheme() {
-  // Gemini-style light is the default; Aurora dark only if explicitly chosen.
-  return localStorage.getItem(THEME_KEY) === 'dark' ? 'dark' : 'light';
+  let v = localStorage.getItem(THEME_KEY);
+  if (v === 'light') v = 'gemini';     // migrate the old binary values
+  if (v === 'dark') v = 'aurora';
+  return THEME_IDS.includes(v) ? v : 'gemini';
 }
-function applyTheme(theme) {
+function _themeMeta(id) { return THEMES.find(t => t.id === id) || THEMES[0]; }
+
+function applyTheme(id) {
+  const meta = _themeMeta(id);
   if (document.body) {
-    document.body.classList.toggle('theme-dark', theme === 'dark');
+    document.body.dataset.theme = meta.id;
+    document.body.classList.toggle('theme-dark', !!meta.dark);
   }
   const btn = document.getElementById('themeToggle');
-  if (btn) btn.innerHTML = theme === 'dark' ? svgIcon('sun') : svgIcon('moon');
-  // Re-render an open chart with new theme colors — guard against TDZ
-  // since this function may be invoked before _activeResult/_activeChart
-  // have been declared in the script.
+  if (btn) {
+    btn.innerHTML = `<span class="theme-dot" style="background:${meta.sw}"></span>`;
+    btn.title = `Theme: ${meta.label} — click to change`;
+  }
+  // Re-render an open chart with new theme colors (guard against TDZ).
   try {
     if (typeof _activeResult !== 'undefined' && typeof _activeChart !== 'undefined'
         && _activeResult && _activeChart) {
@@ -859,28 +875,54 @@ function applyTheme(theme) {
     }
   } catch {}
 }
-function toggleTheme() {
-  const next = getTheme() === 'dark' ? 'light' : 'dark';
-  localStorage.setItem(THEME_KEY, next);
-  applyTheme(next);
+function setTheme(id) {
+  localStorage.setItem(THEME_KEY, id);
+  applyTheme(id);
 }
-// Apply on load — only set the body class right now; defer chart re-render
-// until after DOMContentLoaded when all module-level vars are initialised.
+
+function openThemeMenu() {
+  document.querySelectorAll('.theme-menu').forEach(m => m.remove());
+  const btn = document.getElementById('themeToggle');
+  if (!btn) return;
+  const cur = getTheme();
+  const menu = document.createElement('div');
+  menu.className = 'theme-menu';
+  menu.innerHTML = `<div class="tm-head">Theme</div>` + THEMES.map(t => `
+    <button class="tm-item ${t.id === cur ? 'on' : ''}" data-theme-id="${t.id}">
+      <span class="tm-dot" style="background:${t.sw}"></span>
+      <span class="tm-label">${t.label}</span>
+      <span class="tm-mode">${t.dark ? 'Dark' : 'Light'}</span>
+      ${t.id === cur ? svgIcon('check', 13) : ''}
+    </button>`).join('');
+  document.body.appendChild(menu);
+  const r = btn.getBoundingClientRect();
+  menu.style.top = `${r.bottom + 8}px`;
+  menu.style.right = `${Math.max(8, window.innerWidth - r.right)}px`;
+  menu.querySelectorAll('.tm-item').forEach(it =>
+    it.addEventListener('click', () => { setTheme(it.dataset.themeId); menu.remove(); }));
+  setTimeout(() => {
+    document.addEventListener('click', function close(e) {
+      if (!menu.contains(e.target) && !btn.contains(e.target)) {
+        menu.remove(); document.removeEventListener('click', close);
+      }
+    });
+  }, 0);
+}
+
+// Apply on load — set body theme attrs early; defer chart re-render.
 (function applyThemeClassEarly() {
-  const t = getTheme();
-  if (document.body) {
-    document.body.classList.toggle('theme-dark', t === 'dark');
-  } else {
-    document.addEventListener('DOMContentLoaded', () => {
-      document.body.classList.toggle('theme-dark', t === 'dark');
-    }, { once: true });
-  }
+  const meta = _themeMeta(getTheme());
+  const set = () => {
+    document.body.dataset.theme = meta.id;
+    document.body.classList.toggle('theme-dark', !!meta.dark);
+  };
+  if (document.body) set();
+  else document.addEventListener('DOMContentLoaded', set, { once: true });
 })();
 
-// Wire up the toggle button
 document.addEventListener('DOMContentLoaded', () => {
   const tb = $('themeToggle');
-  if (tb) tb.addEventListener('click', toggleTheme);
+  if (tb) tb.addEventListener('click', openThemeMenu);
   applyTheme(getTheme());
   const t = $('notifToggle');
   if (t) {
