@@ -34,9 +34,21 @@ CONFIG = {
 
 
 def fetch_ohlc(ticker, days=400, interval='1d'):
-    """Fetch OHLC. interval: '1d', '1wk', '1h'.
-    For hourly, yfinance caps period at ~730 days. For weekly we need more
-    calendar to get a similar number of bars, so we widen the period."""
+    """Fetch OHLC. interval: '1d', '1wk', '1h'. Uses Kite Connect when configured,
+    otherwise yfinance (which caps 1h at ~730d and needs a wider weekly window)."""
+    min_bars = 30 if interval == '1h' else (40 if interval == '1wk' else 100)
+
+    # Preferred source: Kite (live brokerage feed) when configured + authenticated.
+    try:
+        import kite_data
+        if kite_data.active():
+            kdf = kite_data.fetch_ohlc(ticker, days=days, interval=interval)
+            if kdf is not None and len(kdf) >= min_bars:
+                return kdf
+            # else fall through to yfinance
+    except Exception as e:
+        print(f'[kite] fetch_ohlc -> yfinance fallback: {e}')
+
     if interval == '1h':
         period_str = f'{min(days, 720)}d'
     elif interval == '1wk':
@@ -46,7 +58,6 @@ def fetch_ohlc(ticker, days=400, interval='1d'):
 
     df = yf.download(ticker, period=period_str, interval=interval, progress=False,
                      auto_adjust=True, threads=False)
-    min_bars = 30 if interval == '1h' else (40 if interval == '1wk' else 100)
     if df is None or df.empty or len(df) < min_bars:
         return None
     if isinstance(df.columns, pd.MultiIndex):
