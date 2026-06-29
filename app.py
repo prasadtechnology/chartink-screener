@@ -32,6 +32,7 @@ from sector_rs import NIFTY_TICKER, compute_sector_rankings, fetch_close_series
 from vcp_screener import (compute_moving_averages, fetch_ohlc,
                           score_and_analyse)
 import db
+import kite_data
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
@@ -568,28 +569,33 @@ def holdings_refresh():
     if not holdings:
         return jsonify({'holdings': [], 'summary': {}})
 
-    # Fetch the latest price for every distinct ticker in parallel — yfinance
-    # I/O dominates, while the per-position math below is cheap. (Same pattern
-    # as the sector endpoint.)
     tickers = {to_yfinance_ticker(h['symbol'], h['exchange']) for h in holdings}
-
-    def fetch_cmp(ticker):
-        try:
-            df = yf.download(ticker, period='5d', progress=False,
-                             auto_adjust=True, threads=False)
-            if df is None or df.empty:
-                return ticker, None, 'No data'
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = [c[0] for c in df.columns]
-            df.columns = [c.lower() for c in df.columns]
-            return ticker, float(df['close'].iloc[-1]), None
-        except Exception as e:
-            return ticker, None, str(e)
-
     cmp_by_ticker = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(tickers))) as ex:
-        for ticker, last_close, err in ex.map(fetch_cmp, tickers):
-            cmp_by_ticker[ticker] = (last_close, err)
+
+    if kite_data.active():
+        # One Kite call covers every ticker.
+        prices = kite_data.ltp(list(tickers))
+        for t in tickers:
+            lp = prices.get(t)
+            cmp_by_ticker[t] = (lp, None if lp is not None else 'No data')
+    else:
+        # yfinance: fetch each distinct ticker in parallel (I/O-bound).
+        def fetch_cmp(ticker):
+            try:
+                df = yf.download(ticker, period='5d', progress=False,
+                                 auto_adjust=True, threads=False)
+                if df is None or df.empty:
+                    return ticker, None, 'No data'
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = [c[0] for c in df.columns]
+                df.columns = [c.lower() for c in df.columns]
+                return ticker, float(df['close'].iloc[-1]), None
+            except Exception as e:
+                return ticker, None, str(e)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(tickers))) as ex:
+            for ticker, last_close, err in ex.map(fetch_cmp, tickers):
+                cmp_by_ticker[ticker] = (last_close, err)
 
     results = []
     total_invested = total_value = total_open_risk = total_locked_profit = 0.0
@@ -840,6 +846,38 @@ def sectors_leaders():
 
     payload['_cached'] = False
     return jsonify(payload)
+
+
+# ---------------------------------------------------------------------------
+# Kite Connect — optional live data source (token must be refreshed daily)
+# ---------------------------------------------------------------------------
+@app.route('/kite/login')
+@login_required
+def kite_login():
+    url = kite_data.login_url()
+    if not url:
+        return ('Kite is not configured. Set KITE_API_KEY, KITE_API_SECRET and '
+                'DATA_SOURCE=kite, then restart.'), 400
+    return redirect(url)
+
+
+@app.route('/kite/callback')
+@login_required
+def kite_callback():
+    request_token = request.args.get('request_token')
+    if not request_token:
+        return redirect(url_for('index'))
+    try:
+        kite_data.complete_login(request_token)
+    except Exception as e:
+        return f'Kite login failed: {e}', 400
+    return redirect(url_for('index'))
+
+
+@app.route('/api/kite/status')
+@login_required
+def kite_status():
+    return jsonify({'enabled': kite_data.enabled(), 'connected': kite_data.active()})
 
 
 if __name__ == '__main__':

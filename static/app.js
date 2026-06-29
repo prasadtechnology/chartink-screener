@@ -2450,6 +2450,29 @@ window.fetch = async (...args) => {
 };
 
 initUserPill();
+
+// Kite live-data status pill (only shows when DATA_SOURCE=kite is configured)
+async function initKite() {
+  const pill = $('kitePill');
+  if (!pill) return;
+  try {
+    const s = await (await fetch('/api/kite/status')).json();
+    if (!s.enabled) return;                 // not configured — stays hidden
+    pill.classList.remove('hidden');
+    if (s.connected) {
+      pill.textContent = '● Kite live';
+      pill.classList.add('connected');
+      pill.removeAttribute('href');
+      pill.title = 'Live data via Kite — re-login tomorrow';
+    } else {
+      pill.textContent = 'Connect Kite';
+      pill.classList.remove('connected');
+      pill.href = '/kite/login';
+      pill.title = 'Log in to Kite for live data (once a day)';
+    }
+  } catch (e) { /* leave hidden on error */ }
+}
+initKite();
 // Load custom sections in parallel — they may be empty for new users
 loadCustomSections();
 

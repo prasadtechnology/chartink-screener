@@ -39,6 +39,16 @@ def fetch_close_series(ticker: str, days: int = 200, _retried: bool = False) -> 
 
     On transient 401/crumb errors we retry once with a fresh session.
     """
+    # Preferred source: Kite Connect when configured + authenticated.
+    try:
+        import kite_data
+        if kite_data.active():
+            ks = kite_data.fetch_close_series(ticker, days=days)
+            if ks is not None and len(ks) > 0:
+                return ks
+    except Exception:
+        pass
+
     import time as _time
     try:
         df = yf.download(

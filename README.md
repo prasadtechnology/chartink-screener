@@ -73,6 +73,27 @@ Environment variables:
 - `VCP_SECRET_PATH=/path/to/secret` — Flask session signing key (default: `.flask_secret` in cwd, auto-generated)
 - `VCP_DB_PATH=/path/to/vcp_scanner.db` — SQLite database location (default: `vcp_scanner.db` in cwd)
 - `COOKIE_SECURE=1` — mark session cookies `Secure` (set this on any HTTPS deployment; leave unset for local HTTP dev)
+- `DATA_SOURCE=kite` — use Zerodha Kite Connect for live + historical data instead of yfinance (default: `yfinance`)
+- `KITE_API_KEY` / `KITE_API_SECRET` — your Kite Connect app credentials (required when `DATA_SOURCE=kite`)
+
+## Live data via Kite Connect (optional)
+
+By default the app uses **yfinance** (free, unofficial, delayed/rate-limited).
+For real-time, reliable data you can switch to **Zerodha Kite Connect**:
+
+1. Subscribe to Kite Connect (data API, ~₹500/month) and create an app at
+   [developers.kite.trade](https://developers.kite.trade). Set its **redirect URL**
+   to `http://127.0.0.1:5000/kite/callback`.
+2. Export before launching:
+   ```bash
+   DATA_SOURCE=kite KITE_API_KEY=xxx KITE_API_SECRET=yyy python app.py
+   ```
+3. A **Connect Kite** pill appears in the header. Click it once each day to log in
+   (Kite access tokens expire daily). After that, the screener, holdings and sector
+   data all use your live Kite feed; the token is cached in `.kite_token`.
+
+If Kite isn't configured or you haven't logged in for the day, the app falls back
+to yfinance automatically — nothing breaks.
 
 ## Backtest scripts (for reference, not deployed)
 

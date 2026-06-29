@@ -30,6 +30,9 @@ build/
 # Flask session secret (auto-generated)
 .flask_secret
 
+# Kite Connect daily access token (auto-generated)
+.kite_token
+
 # Backtest cache and results (machine-generated)
 backtest_cache/
 backtest_results*.json

@@ -3141,3 +3141,15 @@ body.theme-dark .toast { box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5); }
 
 /* Gentle light-mode header (no hard divider) */
 body:not(.theme-dark) .site-header { border-bottom-color: transparent; box-shadow: 0 1px 0 var(--border); }
+
+/* Kite live-data pill */
+.kite-pill {
+  font-family: var(--font-sans); font-size: 0.72rem; font-weight: 500;
+  color: var(--accent); background: var(--accent-dim);
+  border: 1px solid var(--accent-line); border-radius: 999px;
+  padding: 0.3rem 0.7rem; text-decoration: none; cursor: pointer;
+  transition: all 0.14s; white-space: nowrap;
+}
+.kite-pill:hover { background: var(--accent); color: #fff; }
+.kite-pill.connected,
+.kite-pill.connected:hover { color: var(--pos); background: var(--pos-dim); border-color: var(--pos); cursor: default; }
