@@ -840,8 +840,8 @@ function detectAndAlertStopHits(holdings) {
 // ---------------------------------------------------------------------------
 const THEME_KEY = 'vcp_theme_v1';
 function getTheme() {
-  // Aurora is dark-first: default to dark unless the user explicitly picked light.
-  return localStorage.getItem(THEME_KEY) === 'light' ? 'light' : 'dark';
+  // Gemini-style light is the default; Aurora dark only if explicitly chosen.
+  return localStorage.getItem(THEME_KEY) === 'dark' ? 'dark' : 'light';
 }
 function applyTheme(theme) {
   if (document.body) {

@@ -29,7 +29,7 @@
   --amber: #d97706;
   --amber-dim: rgba(217, 119, 6, 0.1);
 
-  --font-display: 'Inter Tight', 'Inter', -apple-system, sans-serif;
+  --font-display: 'Poppins', 'Inter', -apple-system, sans-serif;
   --font-sans: 'Inter', -apple-system, 'Helvetica Neue', sans-serif;
   --font-mono: 'JetBrains Mono', 'SF Mono', Menlo, monospace;
 }
@@ -2862,36 +2862,36 @@ a:focus:not(:focus-visible),
    prefers-reduced-motion block above.
    ============================================================ */
 
-/* ---- Light Aurora (default tokens) ---- */
+/* ---- Gemini-style light (default tokens): soft, airy, pastel ---- */
 :root {
-  --bg: #f4f6fb;
+  --bg: #fbfcff;
   --bg-elev: #ffffff;
-  --bg-elev-2: #eef1f8;
+  --bg-elev-2: #f3f6fc;
   --bg-card: #ffffff;
-  --bg-muted: #e9edf6;
-  --border: rgba(40, 46, 70, 0.10);
-  --border-strong: rgba(40, 46, 70, 0.17);
-  --text: #141828;
-  --text-dim: #515a73;
-  --text-faint: #8b93ac;
-  --accent: #5b54e6;
-  --accent-hover: #4a43d6;
-  --accent-2: #0ea5c4;
-  --accent-dim: rgba(91, 84, 230, 0.10);
-  --accent-line: rgba(91, 84, 230, 0.38);
-  --pos: #0a9a6a;
-  --pos-dim: rgba(10, 154, 106, 0.10);
-  --neg: #e0444d;
-  --neg-dim: rgba(224, 68, 77, 0.10);
-  --grad-accent: linear-gradient(135deg, #6366f1, #0ea5c4);
-  --glow-accent: 0 6px 20px rgba(99, 102, 241, 0.26);
-  --glow-hover: 0 11px 28px rgba(99, 102, 241, 0.34);
+  --bg-muted: #f1f4fa;
+  --border: rgba(20, 40, 80, 0.07);
+  --border-strong: rgba(20, 40, 80, 0.13);
+  --text: #1f2530;
+  --text-dim: #5f6571;
+  --text-faint: #9aa1ad;
+  --accent: #2f6df6;
+  --accent-hover: #245fe0;
+  --accent-2: #8a5cf6;
+  --accent-dim: rgba(47, 109, 246, 0.09);
+  --accent-line: rgba(47, 109, 246, 0.30);
+  --pos: #1aa37a;
+  --pos-dim: rgba(26, 163, 122, 0.10);
+  --neg: #e5484d;
+  --neg-dim: rgba(229, 72, 77, 0.10);
+  --grad-accent: linear-gradient(135deg, #3b82f6, #8a5cf6);
+  --glow-accent: 0 6px 18px rgba(47, 109, 246, 0.22);
+  --glow-hover: 0 12px 28px rgba(47, 109, 246, 0.30);
   --card-surface: #ffffff;
-  --shadow-card: 0 2px 10px rgba(30, 35, 60, 0.06);
-  --shadow-hover: 0 14px 32px rgba(30, 35, 60, 0.14);
-  --glass-header: rgba(255, 255, 255, 0.72);
-  --aurora-1: rgba(99, 102, 241, 0.14);
-  --aurora-2: rgba(6, 182, 212, 0.12);
+  --shadow-card: 0 4px 20px rgba(30, 50, 90, 0.05);
+  --shadow-hover: 0 12px 30px rgba(30, 50, 90, 0.10);
+  --glass-header: rgba(255, 255, 255, 0.78);
+  --aurora-1: rgba(120, 170, 255, 0.32);
+  --aurora-2: rgba(170, 150, 255, 0.24);
 }
 
 /* ---- Dark Aurora (hero) ---- */
@@ -3121,3 +3121,23 @@ body.theme-dark .toast { box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5); }
 .jr-section .section-head .btn-link-danger:hover { color: var(--neg); border-color: var(--neg); background: var(--neg-dim); }
 .jr-del { background: transparent; border: none; color: var(--text-faint); cursor: pointer; font-size: 0.95rem; line-height: 1; padding: 0 0.25rem; border-radius: 4px; }
 .jr-del:hover { color: var(--neg); background: var(--neg-dim); }
+
+/* ============================================================
+   GEMINI-STYLE SOFTNESS — rounder surfaces, pill controls, airy
+   headings, gentle shadows. Applies to both themes.
+   ============================================================ */
+.page-title { font-weight: 300; letter-spacing: -0.015em; }
+.auth-title, .confirm-title { font-weight: 400; }
+
+/* Rounder, softer surfaces */
+.card, .se-card, .jr-card, .results-section, .holdings-table, .jr-table,
+.modal, .confirm-box, .trade-strip, .jr-months, .indicators-panel,
+.breakouts-block, .jr-eq, .sector-leaders-grid > * { border-radius: 16px; }
+.dropzone { border-radius: 18px; }
+
+/* Pill controls */
+.btn-primary, .auth-submit, #confirmOk, #confirmCancel, .ht-close { border-radius: 999px; }
+.main-nav, .nav-tab { border-radius: 999px; }
+
+/* Gentle light-mode header (no hard divider) */
+body:not(.theme-dark) .site-header { border-bottom-color: transparent; box-shadow: 0 1px 0 var(--border); }
