@@ -3244,3 +3244,34 @@ body.theme-dark[data-theme="amber"] {
 .theme-menu .tm-label { flex: 1; font-weight: 500; }
 .theme-menu .tm-mode { font-size: 0.64rem; color: var(--text-faint); font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.04em; }
 .theme-menu .tm-item .icon { color: var(--accent); }
+
+/* ============================================================
+   CREATIVE LOADER — accent bars rising like volume candles + caption.
+   ============================================================ */
+.loader {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 0.95rem; padding: 2.75rem 1rem;
+}
+.loader-bars { display: flex; align-items: flex-end; gap: 5px; height: 38px; }
+.loader-bars span {
+  width: 7px; height: 38px; border-radius: 4px;
+  background: var(--accent);
+  transform-origin: bottom;
+  animation: loaderBar 1s ease-in-out infinite;
+}
+.loader-bars span:nth-child(1) { animation-delay: 0s; }
+.loader-bars span:nth-child(2) { animation-delay: 0.12s; }
+.loader-bars span:nth-child(3) { animation-delay: 0.24s; }
+.loader-bars span:nth-child(4) { animation-delay: 0.36s; }
+.loader-bars span:nth-child(5) { animation-delay: 0.48s; }
+@keyframes loaderBar { 0%, 100% { transform: scaleY(0.28); opacity: 0.45; } 50% { transform: scaleY(1); opacity: 1; } }
+.loader-msg { font-family: var(--font-mono); font-size: 0.8rem; color: var(--text-dim); }
+
+/* Shimmer skeleton (available for card grids) */
+.skeleton {
+  background: linear-gradient(90deg, var(--bg-muted) 25%, var(--bg-elev-2) 50%, var(--bg-muted) 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.4s ease infinite;
+  border-radius: 12px;
+}
+@keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }

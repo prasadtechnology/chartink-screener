@@ -57,6 +57,25 @@ function svgIcon(name, size = 18) {
   return `<svg class="icon" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ''}</svg>`;
 }
 
+// Creative loader — a small "ticker tape" of accent bars rising like volume
+// candles, with a caption. Use rotateMsg() to cycle captions on long waits.
+function loaderHTML(msg) {
+  return `<div class="loader">
+    <div class="loader-bars"><span></span><span></span><span></span><span></span><span></span></div>
+    <div class="loader-msg">${esc(msg || 'Loading…')}</div>
+  </div>`;
+}
+function rotateMsg(root, msgs) {
+  let i = 0;
+  const id = setInterval(() => {
+    const el = root && root.querySelector('.loader-msg');
+    if (!el) { clearInterval(id); return; }   // loader gone — stop
+    i = (i + 1) % msgs.length;
+    el.textContent = msgs[i];
+  }, 2400);
+  return id;
+}
+
 // ---------------------------------------------------------------------------
 // Toasts — non-blocking transient feedback (replaces alert() for messages).
 // type: 'info' | 'success' | 'error'. Auto-dismisses; click × to close early.
@@ -1065,7 +1084,7 @@ function sortAndRerender() {
         </div>
         <p class="section-sub">Sectors ranked by relative strength vs Nifty. Click any sector to expand its top stocks; click any stock to open its chart.</p>
         <div id="sectorLeadersGrid" class="sector-leaders-grid">
-          <p class="empty-tab">Loading sector data…</p>
+          ${loaderHTML('Loading sector data…')}
         </div>
       </div>
     `;
@@ -1321,9 +1340,8 @@ async function loadSectorLeaders(forceRefresh = false, gridEl = null) {
   const grid = gridEl || document.getElementById('sectorLeadersGrid');
   if (!grid) return;
   const lookback = getSectorLookback();
-  grid.innerHTML = forceRefresh
-    ? `<p class="empty-tab">Refreshing — fetching ~80 stocks from Yahoo, takes 30-60 seconds…</p>`
-    : `<p class="empty-tab">Loading sector data…</p>`;
+  grid.innerHTML = loaderHTML(forceRefresh ? 'Refreshing — fetching ~80 stocks…' : 'Loading sector data…');
+  rotateMsg(grid, ['Fetching ~80 stocks…', 'Ranking sectors vs Nifty…', 'Measuring relative strength…', 'Surfacing the leaders…']);
   try {
     const url = `/api/sectors/leaders?lookback=${lookback}${forceRefresh ? '&refresh=1' : ''}`;
     const r = await fetch(url);
@@ -2554,7 +2572,7 @@ function jrEquitySvg(equity, colors) {
 
 async function renderJournal() {
   const body = $('journalBody');
-  body.innerHTML = `<p class="empty-tab">Loading…</p>`;
+  body.innerHTML = loaderHTML('Crunching your trades…');
   let data;
   try {
     const res = await fetch('/api/closed_positions');
@@ -2686,7 +2704,7 @@ function renderSectorsView() {
         </div>
       </div>
       <p class="section-sub">Sectors ranked by relative strength vs Nifty. Click any sector to expand its top stocks; click any stock to open its chart.</p>
-      <div id="sectorLeadersGridTop" class="sector-leaders-grid"><p class="empty-tab">Loading sector data…</p></div>
+      <div id="sectorLeadersGridTop" class="sector-leaders-grid">${loaderHTML('Loading sector data…')}</div>
     </div>`;
   const grid = body.querySelector('#sectorLeadersGridTop');
   loadSectorLeaders(false, grid);
@@ -2858,7 +2876,7 @@ async function renderHoldings() {
       <div class="right">R</div>
       <div></div>
     </div>
-    <div style="padding:1.25rem;font-family:var(--font-mono);color:var(--text-faint);font-size:0.8rem">Fetching prices…</div>
+    ${loaderHTML('Fetching live prices…')}
   `;
 
   try {
