@@ -285,12 +285,19 @@ def screen_one():
             cached['_cached'] = True
             return jsonify(cached)
 
-    # Cache miss — fetch fresh from yfinance
-    ticker = to_yfinance_ticker(symbol, exchange)
+    # Cache miss — fetch fresh. Try the requested exchange; if it returns no
+    # data, fall back to BSE (some symbols are renamed/delisted on NSE but still
+    # trade on BSE). `no_data` flags symbols unavailable on both.
     try:
-        result = score_and_analyse(ticker)
+        resolved = (exchange or 'NSE').upper()
+        result = score_and_analyse(to_yfinance_ticker(symbol, resolved))
+        if result.get('error') and resolved != 'BSE':
+            bse = score_and_analyse(to_yfinance_ticker(symbol, 'BSE'))
+            if not bse.get('error'):
+                result, resolved = bse, 'BSE'
         result['input_symbol'] = symbol
-        # Persist to cache (fire-and-forget; don't fail the request if cache fails)
+        result['resolved_exchange'] = resolved
+        result['no_data'] = bool(result.get('error'))
         try:
             db.set_chart_cache(symbol, exchange, 'screen', result)
         except Exception as cache_err:
@@ -298,10 +305,9 @@ def screen_one():
         result['_cached'] = False
         return jsonify(result)
     except Exception as e:
-        # Log full detail server-side; don't leak tracebacks/paths to the client.
         print(f'[screen_one] {symbol} failed: {traceback.format_exc()}')
         return jsonify({
-            'input_symbol': symbol, 'ticker': ticker, 'error': str(e), 'score': 0,
+            'input_symbol': symbol, 'error': str(e), 'score': 0, 'no_data': True,
         })
 
 
@@ -326,11 +332,16 @@ def chart_data():
             cached['_cached'] = True
             return jsonify(cached)
 
-    ticker = to_yfinance_ticker(symbol, exchange)
+    resolved = (exchange or 'NSE').upper()
+    ticker = to_yfinance_ticker(symbol, resolved)
     try:
         df = fetch_ohlc(ticker, days=400, interval=interval)
+        if (df is None or df.empty) and resolved != 'BSE':
+            df = fetch_ohlc(to_yfinance_ticker(symbol, 'BSE'), days=400, interval=interval)
+            if df is not None and not df.empty:
+                resolved = 'BSE'
         if df is None or df.empty:
-            return jsonify({'error': f'No {interval} data for {symbol}'}), 404
+            return jsonify({'error': f'No {interval} data for {symbol}', 'no_data': True}), 404
         max_bars = {'1d': 300, '1wk': 200, '1h': 500}[interval]
         df = df.tail(max_bars)
         mas = compute_moving_averages(df)
@@ -342,7 +353,7 @@ def chart_data():
             return [None if math.isnan(float(v)) else round(float(v), 2) for v in series]
 
         payload = {
-            'symbol': symbol, 'interval': interval,
+            'symbol': symbol, 'interval': interval, 'resolved_exchange': resolved,
             'times': [ts(d) for d in df.index],
             'open': [round(float(x), 2) for x in df['open']],
             'high': [round(float(x), 2) for x in df['high']],

@@ -321,6 +321,39 @@ async function startBrowseMode(symbols) {
   await openBrowseAt(0);
 }
 
+// "No data" section — collects symbols unavailable on both NSE and BSE.
+async function ensureNoDataSection() {
+  const existing = (state.customSections || []).find(s => s.name === 'No data');
+  if (existing) return existing.id;
+  try {
+    const j = await (await fetch('/api/sections', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'No data', color: '#8a8f98' }),
+    })).json();
+    await loadCustomSections();
+    return j.id;
+  } catch (e) { return null; }
+}
+async function moveToNoDataSection(symbol) {
+  const sym = (symbol || '').toUpperCase();
+  if (!sym) return false;
+  const already = (state.assignments?.[sym] || []).some(id => {
+    const s = (state.customSections || []).find(x => x.id === id);
+    return s && s.name === 'No data';
+  });
+  if (already) return false;
+  const id = await ensureNoDataSection();
+  if (id == null) return false;
+  try {
+    await fetch('/api/assignments', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ symbol: sym, section_id: id }),
+    });
+    await loadCustomSections();
+    return true;
+  } catch (e) { return false; }
+}
+
 async function openBrowseAt(idx, forceRefresh = false) {
   if (idx < 0 || idx >= state.browseList.length) return;
   state.browseIndex = idx;
@@ -350,6 +383,10 @@ async function openBrowseAt(idx, forceRefresh = false) {
     const data = await r.json();
     data.input_symbol = stub.input_symbol;
     state.browseList[idx] = data;
+    if (data.no_data) {
+      const moved = await moveToNoDataSection(stub.input_symbol);
+      if (moved) showToast(`${stub.input_symbol}: no data on NSE or BSE — moved to "No data".`, 'info');
+    }
     openModal(data);
     augmentModalForBrowse();
   } catch (e) {
@@ -712,6 +749,20 @@ async function runScreen() {
 
   const workers = Array.from({ length: concurrency }, worker);
   await Promise.all(workers);
+
+  // Symbols with no data on NSE or BSE -> "No data" section.
+  const noData = state.results.filter(r => r.no_data).map(r => r.input_symbol).filter(Boolean);
+  if (noData.length) {
+    const id = await ensureNoDataSection();
+    if (id != null) {
+      await Promise.all(noData.map(sym => fetch('/api/assignments', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ symbol: sym, section_id: id }),
+      }).catch(() => {})));
+      await loadCustomSections();
+      showToast(`${noData.length} symbol${noData.length === 1 ? '' : 's'} had no data — moved to "No data".`, 'info');
+    }
+  }
 
   state.screening = false;
   $('screenBtn').disabled = false;
@@ -1706,13 +1757,14 @@ function fmtRs(v) {
 
 function openModal(r) {
   if (r.error) {
+    const nd = r.no_data;
     $('modalContent').innerHTML = `
       <div class="modal-head"><div>
         <div class="modal-ticker">${r.input_symbol}</div>
-        <div class="modal-pattern" style="color:var(--neg)">Error</div>
+        <div class="modal-pattern" style="color:var(--neg)">${nd ? 'No data' : 'Error'}</div>
       </div></div>
       <div class="modal-section">
-        <p>${esc(r.error)}</p>
+        <p>${nd ? `No chart data for <b>${esc(r.input_symbol)}</b> on NSE or BSE — likely renamed or delisted. Moved to the “No data” section.` : esc(r.error)}</p>
       </div>`;
     $('modal').classList.remove('hidden');
     return;
