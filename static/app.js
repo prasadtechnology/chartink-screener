@@ -1755,6 +1755,13 @@ function fmtRs(v) {
   return v == null ? '—' : '₹' + Number(v).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
+// Tolerant number parse — strips ₹, commas and spaces so pasted/formatted values
+// like "₹3,800.50" or "1,00,000" work in the entry/stop/qty/exit fields.
+function parseNum(v) {
+  const n = parseFloat(String(v == null ? '' : v).replace(/[^\d.\-]/g, ''));
+  return Number.isFinite(n) ? n : NaN;
+}
+
 function openModal(r) {
   if (r.error) {
     const nd = r.no_data;
@@ -2888,7 +2895,7 @@ function closeHoldingPrompt(h) {
         <h3 class="confirm-title">Close ${esc(h.symbol || 'position')}</h3>
         <p class="confirm-msg">Enter the exit price — this records the trade in your journal.</p>
         <label class="close-field">Exit price
-          <input type="number" id="closeExit" step="0.01" inputmode="decimal" value="${def}">
+          <input type="text" inputmode="decimal" id="closeExit" value="${def}">
         </label>
         <div class="close-preview" id="closePrev"></div>
         <div class="confirm-actions">
@@ -2901,7 +2908,7 @@ function closeHoldingPrompt(h) {
     const prev = back.querySelector('#closePrev');
     const ok = back.querySelector('#closeOk');
     function upd() {
-      const ex = parseFloat(input.value);
+      const ex = parseNum(input.value);
       if (!ex || ex <= 0) { prev.innerHTML = ''; ok.disabled = true; return; }
       ok.disabled = false;
       const pnl = (ex - entry) * qty;
@@ -2913,10 +2920,10 @@ function closeHoldingPrompt(h) {
     function cleanup(v) { back.remove(); document.removeEventListener('keydown', onKey, true); resolve(v); }
     const onKey = (e) => {
       if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); cleanup(null); }
-      else if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); const v = parseFloat(input.value); if (v > 0) cleanup(v); }
+      else if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); const v = parseNum(input.value); if (v > 0) cleanup(v); }
     };
     back.querySelector('#closeCancel').addEventListener('click', () => cleanup(null));
-    ok.addEventListener('click', () => { const v = parseFloat(input.value); if (v > 0) cleanup(v); });
+    ok.addEventListener('click', () => { const v = parseNum(input.value); if (v > 0) cleanup(v); });
     back.addEventListener('mousedown', (e) => { if (e.target === back) cleanup(null); });
     document.addEventListener('keydown', onKey, true);
     setTimeout(() => { input.focus(); input.select(); }, 30);
@@ -2932,9 +2939,9 @@ $('holdingForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const sym = $('hfSymbol').value.trim().toUpperCase();
   const exchange = $('hfExchange').value;
-  const entry = parseFloat($('hfEntry').value);
-  const stop = parseFloat($('hfStop').value);
-  const qty = parseInt($('hfQty').value, 10);
+  const entry = parseNum($('hfEntry').value);
+  const stop = parseNum($('hfStop').value);
+  const qty = Math.round(parseNum($('hfQty').value));
   if (!sym || !entry || !stop || !qty) return;
   if (stop >= entry) {
     showToast('Stop must be below entry price.', 'error');
