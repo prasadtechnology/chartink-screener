@@ -2640,7 +2640,17 @@ async function renderJournal() {
 
   const pos = data.positions || [], s = data.stats || {}, monthly = data.monthly || [], equity = data.equity || [];
   if (!pos.length) {
-    body.innerHTML = `<div class="empty-state"><p>No closed trades yet. Close a position from the <b>Holdings</b> tab and it'll appear here with full performance stats.</p></div>`;
+    let openCount = 0;
+    try { openCount = (await fetchHoldingsRaw()).length; } catch {}
+    const lead = openCount > 0
+      ? `You have <b>${openCount}</b> open position${openCount > 1 ? 's' : ''}, but no <b>closed</b> trades yet. The journal logs trades once you exit them — go to <b>Holdings</b> and hit <b>Close</b> on a position to record it here with full stats.`
+      : `No closed trades yet. Add a position under <b>Holdings</b>, then hit <b>Close</b> when you exit — it'll appear here with win rate, expectancy, streaks, drawdown and more.`;
+    body.innerHTML = `<div class="empty-state">
+      <p>${lead}</p>
+      <button class="btn-primary" id="jrGoHoldings" style="margin-top:1rem">Go to Holdings →</button>
+    </div>`;
+    const go = $('jrGoHoldings');
+    if (go) go.addEventListener('click', () => { const b = document.querySelector('[data-view="holdings"]'); if (b) b.click(); });
     return;
   }
 
