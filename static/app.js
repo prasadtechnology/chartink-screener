@@ -2736,6 +2736,68 @@ document.querySelectorAll('.nav-tab').forEach(t => {
 });
 
 // ---------------------------------------------------------------------------
+// Symbol search — look up any symbol and open its chart, no CSV required
+// ---------------------------------------------------------------------------
+async function searchSymbol(raw) {
+  const sym = (raw || '').trim().toUpperCase().replace(/\.(NS|BO)$/, '');
+  if (!sym) return;
+  hideSearchSuggest();
+  showToast(`Looking up ${sym}…`, 'info', 1400);
+  try {
+    const res = await fetch('/api/screen_one', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ symbol: sym }),
+    });
+    const r = await res.json();
+    if (r && r.error) { showToast(`${sym}: ${r.error}`, 'error'); return; }
+    r.input_symbol = sym;
+    openModal(r);
+  } catch (e) { showToast('Lookup failed: ' + e.message, 'error'); }
+}
+function symbolUniverse() {
+  const set = new Set();
+  (state.symbols || []).forEach(s => set.add(String(s).toUpperCase()));
+  (state.results || []).forEach(r => { if (r.input_symbol) set.add(r.input_symbol.toUpperCase()); });
+  return [...set];
+}
+function hideSearchSuggest() {
+  const s = $('searchSuggest');
+  if (s) { s.classList.add('hidden'); s.innerHTML = ''; }
+}
+function showSearchSuggest(q) {
+  const box = $('searchSuggest');
+  if (!box) return;
+  q = (q || '').trim().toUpperCase();
+  if (!q) { hideSearchSuggest(); return; }
+  const matches = symbolUniverse().filter(s => s.includes(q)).sort((a, b) => {
+    const sa = a.startsWith(q), sb = b.startsWith(q);
+    return sa === sb ? a.localeCompare(b) : (sa ? -1 : 1);
+  }).slice(0, 8);
+  if (!matches.length) { hideSearchSuggest(); return; }
+  box.innerHTML = matches.map(s => `<button class="ss-item" data-sym="${esc(s)}">${esc(s)}</button>`).join('');
+  box.classList.remove('hidden');
+  box.querySelectorAll('.ss-item').forEach(b =>
+    b.addEventListener('click', () => { const inp = $('symSearch'); if (inp) inp.value = ''; searchSymbol(b.dataset.sym); }));
+}
+(function initSearch() {
+  const inp = $('symSearch');
+  if (!inp) return;
+  inp.addEventListener('input', () => showSearchSuggest(inp.value));
+  inp.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); const v = inp.value; inp.value = ''; searchSymbol(v); }
+    else if (e.key === 'Escape') { inp.value = ''; hideSearchSuggest(); inp.blur(); }
+  });
+  document.addEventListener('click', (e) => { if (!e.target.closest('.header-search')) hideSearchSuggest(); });
+  // "/" focuses search (unless typing in a field or a modal is open)
+  document.addEventListener('keydown', (e) => {
+    const tag = ((document.activeElement || {}).tagName) || '';
+    if (e.key === '/' && !/^(INPUT|TEXTAREA|SELECT)$/.test(tag) && !document.querySelector('#modal:not(.hidden)')) {
+      e.preventDefault(); inp.focus();
+    }
+  });
+})();
+
+// ---------------------------------------------------------------------------
 // Holdings module — backed by SQLite via /api/holdings
 // ---------------------------------------------------------------------------
 async function fetchHoldingsRaw() {

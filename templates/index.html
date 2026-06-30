@@ -16,9 +16,16 @@
 <div class="bg-grid"></div>
 
 <header class="site-header">
-  <div class="brand">
-    <span class="brand-mark">◆</span>
-    <span class="brand-name">VCP<span class="brand-sep">·</span>Scanner</span>
+  <div class="header-left">
+    <div class="brand">
+      <span class="brand-mark">◆</span>
+      <span class="brand-name">VCP<span class="brand-sep">·</span>Scanner</span>
+    </div>
+    <div class="header-search">
+      <svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      <input id="symSearch" type="text" placeholder="Search a symbol…  /" autocomplete="off" spellcheck="false" aria-label="Search a symbol">
+      <div class="search-suggest hidden" id="searchSuggest"></div>
+    </div>
   </div>
   <nav class="main-nav">
     <button class="nav-tab active" data-view="scan">Scan</button>
