@@ -1320,6 +1320,7 @@ body { position: relative; overflow-x: hidden; }
 .ht-row .muted { color: var(--text-faint); font-size: 0.72rem; }
 .ht-row .stop-unset { color: var(--warn, #d97706); font-weight: 500; cursor: help; }
 .ht-row .right { text-align: right; }
+.kite-actions { display: inline-flex; gap: 0.6rem; align-items: center; }
 /* "Kite" provenance chip on synced holdings */
 .src-badge {
   display: inline-block;

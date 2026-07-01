@@ -112,6 +112,25 @@ places orders** on your account. It:
 Manually-added positions are never touched by sync. Portfolio sync works even when
 `DATA_SOURCE=yfinance`, as long as you've connected Kite for the day.
 
+### Portfolio sync without an API key (browser login)
+
+Don't want to create a Kite Connect app / manage an API key + secret? The portal
+can sync your holdings through **Zerodha's hosted Kite MCP** (`mcp.kite.trade`)
+instead — the app connects to it directly (no LLM/assistant involved) and you just
+log in through the browser:
+
+1. On the **Holdings** tab, click **🔗 Connect Kite**.
+2. A Zerodha login opens in a new tab — sign in (username + 2FA). No API key needed.
+3. The portal detects the login and syncs automatically; the **⟳ Sync from Kite**
+   button then refreshes on demand.
+
+This path is **strictly read-only** — the app only ever calls Kite's read tools
+(`get_holdings`, `get_positions`, `get_gtts`, `get_trades`, `get_ltp`), and the
+hosted MCP blocks order-placement tools entirely. The login lasts for the day, like
+Kite Connect. Note it relies on Zerodha's hosted MCP service, which is newer than
+the Kite Connect API; if you want the most officially-supported path, use the API
+key/secret option above.
+
 ## Backtest scripts (for reference, not deployed)
 
 - `backtest.py` — algorithmic VCP entry/stop walk-forward. **Loses money in 2 of 3 test years; do not deploy.**

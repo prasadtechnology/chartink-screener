@@ -2643,51 +2643,101 @@ window.fetch = async (...args) => {
 
 initUserPill();
 
-// Kite live-data status pill (only shows when DATA_SOURCE=kite is configured)
+// ---------------------------------------------------------------------------
+// Kite connection: header "live data" pill + Holdings sync (Connect / Sync)
+// ---------------------------------------------------------------------------
+// Two read-only ways the portal can reach Kite:
+//   • Kite Connect  (API key/secret; DATA_SOURCE=kite) — status /api/kite/status
+//   • Kite MCP      (browser login, no key/secret)      — status /api/kite_mcp/status
+// kiteMode records which is live so Sync posts to the right endpoint.
+let kiteMode = null;   // 'connect' | 'mcp' | null
+
 async function initKite() {
-  try {
-    const s = await (await fetch('/api/kite/status')).json();
+  let kc = {};
+  try { kc = await (await fetch('/api/kite/status')).json(); } catch (_) {}
 
-    // "Sync from Kite" is available whenever the Kite portfolio is authorised for
-    // the day, independent of whether charts come from Kite or yfinance. Auto-sync
-    // once on load so anything closed in Kite since last visit lands in the journal.
-    if (s.portfolio_ready) {
-      $('syncKiteBtn')?.classList.remove('hidden');
-      syncKite({ silent: true });
-    }
-
-    const pill = $('kitePill');
-    if (!pill || !s.enabled) return;        // pill only when DATA_SOURCE=kite
+  // Header "live data" pill (only when DATA_SOURCE=kite is configured)
+  const pill = $('kitePill');
+  if (pill && kc.enabled) {
     pill.classList.remove('hidden');
-    if (s.connected) {
-      pill.textContent = '● Kite live';
-      pill.classList.add('connected');
-      pill.removeAttribute('href');
-      pill.title = 'Live data via Kite — re-login tomorrow';
+    if (kc.connected) {
+      pill.textContent = '● Kite live'; pill.classList.add('connected');
+      pill.removeAttribute('href'); pill.title = 'Live data via Kite — re-login tomorrow';
     } else {
-      pill.textContent = 'Connect Kite';
-      pill.classList.remove('connected');
-      pill.href = '/kite/login';
-      pill.title = 'Log in to Kite for live data (once a day)';
+      pill.textContent = 'Connect Kite'; pill.classList.remove('connected');
+      pill.href = '/kite/login'; pill.title = 'Log in to Kite for live data (once a day)';
     }
-  } catch (e) { /* leave hidden on error */ }
+  }
+
+  // Holdings sync: prefer Kite Connect when authorised, else the browser-login MCP.
+  if (kc.portfolio_ready) {
+    kiteMode = 'connect'; showSyncButton(); syncKite({ silent: true }); return;
+  }
+  let mcp = {};
+  try { mcp = await (await fetch('/api/kite_mcp/status')).json(); } catch (_) {}
+  if (mcp.connected) {
+    kiteMode = 'mcp'; showSyncButton(); syncKite({ silent: true });
+  } else {
+    $('connectKiteBtn')?.classList.remove('hidden');   // offer browser login
+  }
 }
 
-// Read-only Kite -> portal sync: import holdings/positions, move Kite-side closes
-// into the journal. `silent` suppresses the "up to date" toast for the auto-sync.
+function showSyncButton() {
+  $('connectKiteBtn')?.classList.add('hidden');
+  $('syncKiteBtn')?.classList.remove('hidden');
+}
+function showConnectButton() {
+  kiteMode = null;
+  $('syncKiteBtn')?.classList.add('hidden');
+  $('connectKiteBtn')?.classList.remove('hidden');
+}
+
+// Browser login via the hosted Kite MCP — no API key/secret, read-only.
+async function connectKite() {
+  const btn = $('connectKiteBtn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Opening Kite…'; }
+  try {
+    const j = await (await fetch('/api/kite_mcp/login', { method: 'POST' })).json();
+    if (!j.login_url) throw new Error(j.error || 'could not start login');
+    window.open(j.login_url, '_blank', 'noopener');
+    showToast('Complete the Kite login in the new tab — I\'ll sync automatically once you\'re in.', 'info');
+    const started = Date.now();
+    const poll = setInterval(async () => {
+      let st = {};
+      try { st = await (await fetch('/api/kite_mcp/status')).json(); } catch (_) {}
+      if (st.connected) {
+        clearInterval(poll);
+        kiteMode = 'mcp'; showSyncButton(); syncKite({ silent: false });
+      } else if (Date.now() - started > 180000) {   // give up after 3 min
+        clearInterval(poll);
+        if (btn) { btn.disabled = false; btn.textContent = '🔗 Connect Kite'; }
+      }
+    }, 2500);
+  } catch (e) {
+    showToast('Kite connect failed: ' + e.message, 'error');
+    if (btn) { btn.disabled = false; btn.textContent = '🔗 Connect Kite'; }
+  }
+}
+
+// Read-only sync: import holdings/positions, move Kite-side closes into the journal.
 async function syncKite({ silent = false } = {}) {
+  const endpoint = kiteMode === 'mcp' ? '/api/kite_mcp/sync' : '/api/holdings/sync_kite';
   const btn = $('syncKiteBtn');
-  const label = btn ? btn.textContent : '';
   if (btn) { btn.disabled = true; btn.textContent = 'Syncing…'; }
   try {
-    const res = await fetch('/api/holdings/sync_kite', {
+    const res = await fetch(endpoint, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ include_positions: true }),
     });
     const j = await res.json().catch(() => ({}));
     if (!res.ok) {
+      if (j.error === 'not_authenticated' || j.error === 'not_connected') {
+        showConnectButton();   // MCP session expired — offer login again
+        if (!silent) showToast('Kite session expired — click Connect Kite to log in again.', 'info');
+        return;
+      }
       if (j.error === 'kite_not_connected') {
-        if (!silent) showToast('Connect Kite first (once a day) to sync your portfolio.', 'info');
+        if (!silent) showToast('Connect Kite first to sync your portfolio.', 'info');
         return;
       }
       throw new Error(j.error || 'sync failed');
@@ -2706,9 +2756,10 @@ async function syncKite({ silent = false } = {}) {
   } catch (e) {
     if (!silent) showToast('Kite sync failed: ' + e.message, 'error');
   } finally {
-    if (btn) { btn.disabled = false; btn.textContent = label || '⟳ Sync from Kite'; }
+    if (btn) { btn.disabled = false; btn.textContent = '⟳ Sync from Kite'; }
   }
 }
+$('connectKiteBtn')?.addEventListener('click', connectKite);
 $('syncKiteBtn')?.addEventListener('click', () => syncKite({ silent: false }));
 
 initKite();

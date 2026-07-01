@@ -240,7 +240,10 @@
   <section id="holdingsListSection">
     <div class="section-head">
       <h2 class="label">Open positions</h2>
-      <button class="btn-link hidden" id="syncKiteBtn" title="Import your Kite holdings &amp; positions. Anything you've sold in Kite moves to the journal. Read-only — no orders are placed.">⟳ Sync from Kite</button>
+      <span class="kite-actions">
+        <button class="btn-link hidden" id="connectKiteBtn" title="Log in to Kite in your browser — no API key/secret needed. Read-only.">🔗 Connect Kite</button>
+        <button class="btn-link hidden" id="syncKiteBtn" title="Import your Kite holdings &amp; positions. Anything you've sold in Kite moves to the journal. Read-only — no orders are placed.">⟳ Sync from Kite</button>
+      </span>
     </div>
     <div id="holdingsEmpty" class="empty-state">
       <p>No positions yet. Add one above, or <button class="btn-link inline" id="loadSampleBtn">load sample</button>.</p>

@@ -33,6 +33,7 @@ from vcp_screener import (compute_moving_averages, fetch_ohlc,
                           score_and_analyse)
 import db
 import kite_data
+import kite_mcp
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
@@ -445,35 +446,24 @@ def holdings_close(holding_id):
     return jsonify({'ok': True, **result})
 
 
-@app.route('/api/holdings/sync_kite', methods=['POST'])
-@login_required
-def holdings_sync_kite():
-    """Read-only Kite -> portal sync.
-
-    Imports Kite holdings (and, when requested, open intraday/F&O positions),
-    fills each stop from a matching SELL GTT when present, and closes any
-    previously-synced position that has vanished from Kite (i.e. you sold it)
-    into the journal — using the actual realised fill price, else the last price.
-    No orders are ever placed on the account.
-    """
-    if not kite_data.portfolio_ready():
-        return jsonify({'error': 'kite_not_connected'}), 400
-    data = request.get_json(silent=True) or {}
-    include_positions = bool(data.get('include_positions', True))
-    uid = current_user_id()
-
-    kh = kite_data.holdings()
-    if kh is None:
-        return jsonify({'error': 'kite_fetch_failed'}), 502
-
-    # Merge holdings + positions; holdings win, dedupe by EXCH:SYMBOL.
-    merged = {f"{k['exchange']}:{k['symbol']}": k for k in kh}
+def _merge_kite_portfolio(holdings_list, positions_list, include_positions):
+    """Merge Kite holdings + positions into a deduped, long-only item list.
+    Holdings win on overlap; shorts (qty < 0) are dropped (long-only risk model)."""
+    merged = {f"{k['exchange']}:{k['symbol']}": k for k in (holdings_list or [])}
     if include_positions:
-        for it in (kite_data.positions() or []):
+        for it in (positions_list or []):
             merged.setdefault(f"{it['exchange']}:{it['symbol']}", it)
-    kite_items = [v for v in merged.values() if v['qty'] > 0]   # long-only risk model
+    return [v for v in merged.values() if v['qty'] > 0]
 
-    gtt = kite_data.gtt_stops()
+
+def run_portfolio_sync(uid, kite_items, gtt, sells, last_price_fn):
+    """Upsert Kite-sourced holdings and close any that have vanished from Kite.
+
+    Shared by both sync routes (Kite Connect and Kite MCP). A holding is matched
+    by (symbol, exchange); its stop is taken from a SELL GTT when present. A
+    previously-synced holding no longer in Kite is treated as sold and moved to
+    the journal using the realised fill (`sells`), else the last price, else entry.
+    """
     incoming = set()
     added = updated = 0
     for k in kite_items:
@@ -484,20 +474,77 @@ def holdings_sync_kite():
         added += res['action'] == 'added'
         updated += res['action'] == 'updated'
 
-    # Close-detection: a Kite-sourced holding no longer present in Kite was sold.
-    sells = kite_data.sell_fills_today()
     closed = []
     for h in db.list_holdings(uid):
         if h.get('source') != 'kite' or f"{h['exchange']}:{h['symbol']}" in incoming:
             continue
         key = f"{h['exchange']}:{h['symbol']}"
-        exit_price = sells.get(key) or kite_data.last_price(h['exchange'], h['symbol']) or h['entry']
+        exit_price = sells.get(key) or last_price_fn(h['exchange'], h['symbol']) or h['entry']
         r = db.close_holding(uid, h['id'], float(exit_price))
         if r:
             closed.append({'symbol': h['symbol'], 'exit': round(float(exit_price), 2), **r})
+    return {'added': added, 'updated': updated, 'closed': closed, 'synced': len(kite_items)}
 
-    return jsonify({'ok': True, 'added': added, 'updated': updated,
-                    'closed': closed, 'synced': len(kite_items)})
+
+@app.route('/api/holdings/sync_kite', methods=['POST'])
+@login_required
+def holdings_sync_kite():
+    """Read-only Kite -> portal sync via Kite Connect (requires API key/secret).
+    See run_portfolio_sync for the import/close semantics."""
+    if not kite_data.portfolio_ready():
+        return jsonify({'error': 'kite_not_connected'}), 400
+    include_positions = bool((request.get_json(silent=True) or {}).get('include_positions', True))
+    kh = kite_data.holdings()
+    if kh is None:
+        return jsonify({'error': 'kite_fetch_failed'}), 502
+    kite_items = _merge_kite_portfolio(kh, kite_data.positions(), include_positions)
+    res = run_portfolio_sync(current_user_id(), kite_items, kite_data.gtt_stops(),
+                             kite_data.sell_fills_today(), kite_data.last_price)
+    return jsonify({'ok': True, **res})
+
+
+# --- Kite via the hosted Kite MCP: browser login, no API key/secret, read-only ---
+@app.route('/api/kite_mcp/login', methods=['POST'])
+@login_required
+def kite_mcp_login():
+    """Open a Kite MCP session and return the browser login URL for the user."""
+    sid, url = kite_mcp.start_login()
+    if not sid or not url:
+        return jsonify({'error': 'login_init_failed'}), 502
+    session['kite_mcp_sid'] = sid
+    return jsonify({'ok': True, 'login_url': url})
+
+
+@app.route('/api/kite_mcp/status', methods=['GET'])
+@login_required
+def kite_mcp_status():
+    sid = session.get('kite_mcp_sid')
+    return jsonify({'connected': kite_mcp.is_authenticated(sid) if sid else False})
+
+
+@app.route('/api/kite_mcp/logout', methods=['POST'])
+@login_required
+def kite_mcp_logout():
+    session.pop('kite_mcp_sid', None)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/kite_mcp/sync', methods=['POST'])
+@login_required
+def kite_mcp_sync():
+    """Read-only Kite -> portal sync via the browser-login Kite MCP session."""
+    sid = session.get('kite_mcp_sid')
+    if not sid:
+        return jsonify({'error': 'not_connected'}), 400
+    include_positions = bool((request.get_json(silent=True) or {}).get('include_positions', True))
+    kh = kite_mcp.holdings(sid)
+    if kh is None:
+        return jsonify({'error': 'not_authenticated'}), 401   # login not completed / session expired
+    kite_items = _merge_kite_portfolio(kh, kite_mcp.positions(sid), include_positions)
+    res = run_portfolio_sync(current_user_id(), kite_items, kite_mcp.gtt_stops(sid),
+                             kite_mcp.sell_fills_today(sid),
+                             lambda e, s: kite_mcp.last_price(sid, e, s))
+    return jsonify({'ok': True, **res})
 
 
 def compute_journal_stats(rows):
