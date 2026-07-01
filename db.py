@@ -63,6 +63,7 @@ def init_db():
                 qty INTEGER NOT NULL,
                 opened_at INTEGER NOT NULL,
                 notes TEXT,
+                source TEXT NOT NULL DEFAULT 'manual',
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_holdings_user ON holdings(user_id);
@@ -143,6 +144,9 @@ def init_db():
             if _table_exists(conn, tbl) and not _column_exists(conn, tbl, 'user_id'):
                 conn.execute(f'ALTER TABLE {tbl} ADD COLUMN user_id INTEGER')
                 conn.execute(f'UPDATE {tbl} SET user_id = 1 WHERE user_id IS NULL')
+        # Provenance of a holding: 'manual' or 'kite' (added for Kite portfolio sync).
+        if _table_exists(conn, 'holdings') and not _column_exists(conn, 'holdings', 'source'):
+            conn.execute("ALTER TABLE holdings ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")
 
 
 # ---------------- Chart cache (shared across users) ----------------
@@ -370,15 +374,57 @@ def list_holdings(user_id):
         return [dict(r) for r in rows]
 
 
-def add_holding(user_id, symbol, exchange, entry, stop, qty, notes=None):
+def add_holding(user_id, symbol, exchange, entry, stop, qty, notes=None, source='manual'):
     with get_conn() as conn:
         cur = conn.execute(
-            'INSERT INTO holdings (user_id, symbol, exchange, entry, stop, qty, opened_at, notes) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            'INSERT INTO holdings (user_id, symbol, exchange, entry, stop, qty, opened_at, notes, source) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (user_id, symbol.upper(), (exchange or 'NSE').upper(),
-             float(entry), float(stop), int(qty), int(time.time()), notes)
+             float(entry), float(stop), int(qty), int(time.time()), notes, source)
         )
         return cur.lastrowid
+
+
+def upsert_kite_holding(user_id, symbol, exchange, avg_price, qty, stop=None):
+    """Insert or update a Kite-sourced holding, matched on (user, symbol, exchange).
+
+    Returns {'id', 'action': 'added'|'updated'}. Stop handling:
+      - a real stop (0 < stop < entry, e.g. from a GTT) is always adopted;
+      - otherwise the stop is left "unset" (stored == entry, a sentinel that makes
+        open-risk and R read as 0) so the user can fill it in;
+      - a stop the user has already set manually is preserved across syncs.
+    """
+    symbol = symbol.upper()
+    exchange = (exchange or 'NSE').upper()
+    avg_price = float(avg_price)
+    qty = int(qty)
+    has_gtt = stop is not None and 0 < float(stop) < avg_price
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM holdings WHERE user_id = ? AND symbol = ? AND exchange = ? AND source = 'kite'",
+            (user_id, symbol, exchange)
+        ).fetchone()
+        if row:
+            row = dict(row)
+            unset = row['stop'] >= row['entry'] or row['stop'] <= 0
+            if has_gtt:
+                new_stop = float(stop)
+            elif unset:
+                new_stop = avg_price          # keep the "unset" sentinel aligned to the new entry
+            else:
+                new_stop = row['stop']         # preserve a user-set stop
+            conn.execute(
+                'UPDATE holdings SET entry = ?, qty = ?, stop = ? WHERE id = ?',
+                (avg_price, qty, float(new_stop), row['id'])
+            )
+            return {'id': row['id'], 'action': 'updated'}
+        stop_val = float(stop) if has_gtt else avg_price
+        cur = conn.execute(
+            "INSERT INTO holdings (user_id, symbol, exchange, entry, stop, qty, opened_at, notes, source) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'kite')",
+            (user_id, symbol, exchange, avg_price, stop_val, qty, int(time.time()), None)
+        )
+        return {'id': cur.lastrowid, 'action': 'added'}
 
 
 def delete_holding(user_id, id_):

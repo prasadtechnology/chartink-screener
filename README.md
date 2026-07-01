@@ -95,6 +95,23 @@ For real-time, reliable data you can switch to **Zerodha Kite Connect**:
 If Kite isn't configured or you haven't logged in for the day, the app falls back
 to yfinance automatically — nothing breaks.
 
+### Sync your portfolio from Kite
+
+Once you've connected Kite, a **⟳ Sync from Kite** button appears on the Holdings
+tab (and the app auto-syncs once each time it loads). Sync is **read-only — it never
+places orders** on your account. It:
+
+- imports your Kite **holdings** and open **positions** (long-only) as portal positions,
+  tagged with a `Kite` badge;
+- fills each **stop** from a matching stop-loss **GTT** if you have one; otherwise the
+  stop is left unset (shown as `⚠ set stop`) so risk/R stay honest until you add one;
+- **closes** any previously-synced position that's gone from Kite (i.e. you sold it) into
+  your **journal**, using the actual realised sell price for the day, falling back to the
+  last traded price.
+
+Manually-added positions are never touched by sync. Portfolio sync works even when
+`DATA_SOURCE=yfinance`, as long as you've connected Kite for the day.
+
 ## Backtest scripts (for reference, not deployed)
 
 - `backtest.py` — algorithmic VCP entry/stop walk-forward. **Loses money in 2 of 3 test years; do not deploy.**

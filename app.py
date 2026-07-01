@@ -445,6 +445,61 @@ def holdings_close(holding_id):
     return jsonify({'ok': True, **result})
 
 
+@app.route('/api/holdings/sync_kite', methods=['POST'])
+@login_required
+def holdings_sync_kite():
+    """Read-only Kite -> portal sync.
+
+    Imports Kite holdings (and, when requested, open intraday/F&O positions),
+    fills each stop from a matching SELL GTT when present, and closes any
+    previously-synced position that has vanished from Kite (i.e. you sold it)
+    into the journal — using the actual realised fill price, else the last price.
+    No orders are ever placed on the account.
+    """
+    if not kite_data.portfolio_ready():
+        return jsonify({'error': 'kite_not_connected'}), 400
+    data = request.get_json(silent=True) or {}
+    include_positions = bool(data.get('include_positions', True))
+    uid = current_user_id()
+
+    kh = kite_data.holdings()
+    if kh is None:
+        return jsonify({'error': 'kite_fetch_failed'}), 502
+
+    # Merge holdings + positions; holdings win, dedupe by EXCH:SYMBOL.
+    merged = {f"{k['exchange']}:{k['symbol']}": k for k in kh}
+    if include_positions:
+        for it in (kite_data.positions() or []):
+            merged.setdefault(f"{it['exchange']}:{it['symbol']}", it)
+    kite_items = [v for v in merged.values() if v['qty'] > 0]   # long-only risk model
+
+    gtt = kite_data.gtt_stops()
+    incoming = set()
+    added = updated = 0
+    for k in kite_items:
+        key = f"{k['exchange']}:{k['symbol']}"
+        incoming.add(key)
+        res = db.upsert_kite_holding(uid, k['symbol'], k['exchange'],
+                                     k['avg_price'], k['qty'], stop=gtt.get(key))
+        added += res['action'] == 'added'
+        updated += res['action'] == 'updated'
+
+    # Close-detection: a Kite-sourced holding no longer present in Kite was sold.
+    sells = kite_data.sell_fills_today()
+    closed = []
+    for h in db.list_holdings(uid):
+        if h.get('source') != 'kite' or f"{h['exchange']}:{h['symbol']}" in incoming:
+            continue
+        key = f"{h['exchange']}:{h['symbol']}"
+        exit_price = sells.get(key) or kite_data.last_price(h['exchange'], h['symbol']) or h['entry']
+        r = db.close_holding(uid, h['id'], float(exit_price))
+        if r:
+            closed.append({'symbol': h['symbol'], 'exit': round(float(exit_price), 2), **r})
+
+    return jsonify({'ok': True, 'added': added, 'updated': updated,
+                    'closed': closed, 'synced': len(kite_items)})
+
+
 def compute_journal_stats(rows):
     """Rich trading-journal metrics from closed positions.
 
@@ -888,7 +943,8 @@ def kite_callback():
 @app.route('/api/kite/status')
 @login_required
 def kite_status():
-    return jsonify({'enabled': kite_data.enabled(), 'connected': kite_data.active()})
+    return jsonify({'enabled': kite_data.enabled(), 'connected': kite_data.active(),
+                    'portfolio_ready': kite_data.portfolio_ready()})
 
 
 if __name__ == '__main__':

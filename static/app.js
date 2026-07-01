@@ -2645,11 +2645,19 @@ initUserPill();
 
 // Kite live-data status pill (only shows when DATA_SOURCE=kite is configured)
 async function initKite() {
-  const pill = $('kitePill');
-  if (!pill) return;
   try {
     const s = await (await fetch('/api/kite/status')).json();
-    if (!s.enabled) return;                 // not configured — stays hidden
+
+    // "Sync from Kite" is available whenever the Kite portfolio is authorised for
+    // the day, independent of whether charts come from Kite or yfinance. Auto-sync
+    // once on load so anything closed in Kite since last visit lands in the journal.
+    if (s.portfolio_ready) {
+      $('syncKiteBtn')?.classList.remove('hidden');
+      syncKite({ silent: true });
+    }
+
+    const pill = $('kitePill');
+    if (!pill || !s.enabled) return;        // pill only when DATA_SOURCE=kite
     pill.classList.remove('hidden');
     if (s.connected) {
       pill.textContent = '● Kite live';
@@ -2664,6 +2672,45 @@ async function initKite() {
     }
   } catch (e) { /* leave hidden on error */ }
 }
+
+// Read-only Kite -> portal sync: import holdings/positions, move Kite-side closes
+// into the journal. `silent` suppresses the "up to date" toast for the auto-sync.
+async function syncKite({ silent = false } = {}) {
+  const btn = $('syncKiteBtn');
+  const label = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = 'Syncing…'; }
+  try {
+    const res = await fetch('/api/holdings/sync_kite', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ include_positions: true }),
+    });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      if (j.error === 'kite_not_connected') {
+        if (!silent) showToast('Connect Kite first (once a day) to sync your portfolio.', 'info');
+        return;
+      }
+      throw new Error(j.error || 'sync failed');
+    }
+    const bits = [];
+    if (j.added) bits.push(`${j.added} imported`);
+    if (j.updated) bits.push(`${j.updated} updated`);
+    const nClosed = (j.closed || []).length;
+    if (nClosed) bits.push(`${nClosed} closed → journal`);
+    if (!silent || bits.length) {
+      showToast(bits.length ? `Kite sync — ${bits.join(', ')}.` : 'Kite: portfolio already up to date.',
+        nClosed ? 'success' : 'info');
+    }
+    await refreshNavCount();
+    if (!$('holdingsView')?.classList.contains('hidden')) await renderHoldings();
+  } catch (e) {
+    if (!silent) showToast('Kite sync failed: ' + e.message, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = label || '⟳ Sync from Kite'; }
+  }
+}
+$('syncKiteBtn')?.addEventListener('click', () => syncKite({ silent: false }));
+
 initKite();
 // Load custom sections in parallel — they may be empty for new users — then
 // restore today's already-processed scan (if any) once sections are available,
@@ -3110,7 +3157,7 @@ function renderHoldingsTable(data) {
     if (h.error) {
       return `
         <div class="ht-row" style="opacity:0.6">
-          <div><span class="sym">${h.symbol}</span></div>
+          <div><span class="sym">${h.symbol}</span>${h.source === 'kite' ? '<span class="src-badge" title="Synced from Kite">Kite</span>' : ''}</div>
           <div class="right muted">${(h.entry||0).toLocaleString('en-IN')}</div>
           <div class="right muted">Error: ${esc(h.error)}</div>
           <div></div><div></div><div></div><div></div><div></div>
@@ -3125,11 +3172,15 @@ function renderHoldingsTable(data) {
     const rowCls = h.stop_hit ? 'ht-row ht-stop-hit' : 'ht-row';
     const pnlSign = (h.pnl || 0) >= 0 ? '+' : '';
     const rSign = (h.r_multiple || 0) >= 0 ? '+' : '';
+    const kiteBadge = h.source === 'kite' ? '<span class="src-badge" title="Synced from Kite">Kite</span>' : '';
+    const slCell = (h.stop >= h.entry)
+      ? '<span class="muted stop-unset" style="margin-left:0.5rem" title="No stop set — open risk & R need a stop. Add a stop-loss GTT in Kite and re-sync.">⚠ set stop</span>'
+      : `<span class="muted" style="margin-left:0.5rem">SL ₹${h.stop.toLocaleString('en-IN')}</span>`;
     return `
       <div class="${rowCls}">
         <div>
-          <span class="sym">${h.symbol}</span>
-          <span class="muted" style="margin-left:0.5rem">SL ₹${h.stop.toLocaleString('en-IN')}</span>
+          <span class="sym">${h.symbol}</span>${kiteBadge}
+          ${slCell}
         </div>
         <div class="right">₹${h.entry.toLocaleString('en-IN')}</div>
         <div class="right">₹${(h.cmp||0).toLocaleString('en-IN')}</div>

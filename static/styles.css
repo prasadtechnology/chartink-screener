@@ -1318,7 +1318,23 @@ body { position: relative; overflow-x: hidden; }
   font-size: 0.95rem;
 }
 .ht-row .muted { color: var(--text-faint); font-size: 0.72rem; }
+.ht-row .stop-unset { color: var(--warn, #d97706); font-weight: 500; cursor: help; }
 .ht-row .right { text-align: right; }
+/* "Kite" provenance chip on synced holdings */
+.src-badge {
+  display: inline-block;
+  margin-left: 0.4rem;
+  padding: 0.05rem 0.34rem;
+  font-size: 0.6rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--accent, #2563eb);
+  background: color-mix(in srgb, var(--accent, #2563eb) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent, #2563eb) 30%, transparent);
+  border-radius: 999px;
+  vertical-align: middle;
+}
 .ht-pos { color: var(--pos); font-weight: 500; }
 .ht-neg { color: var(--neg); font-weight: 500; }
 .ht-stop-hit {

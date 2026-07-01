@@ -168,3 +168,158 @@ def ltp(tickers):
         print(f'[kite] ltp failed: {e}')
         return {}
     return {t: data[k]['last_price'] for t, k in mapping.items() if k in data}
+
+
+# ---------------------------------------------------------------------------
+# Portfolio (holdings / positions / trades / GTTs)
+# ---------------------------------------------------------------------------
+# These power the "Sync from Kite" feature. Unlike the data functions above they
+# are *decoupled from DATA_SOURCE*: portfolio sync should work whenever the user
+# has connected Kite for the day, even if charts still come from yfinance. They
+# are strictly read-only — no orders are ever placed.
+def _authed_kite():
+    """A KiteConnect authed with today's token, or None. Independent of DATA_SOURCE."""
+    if not (API_KEY and KiteConnect):
+        return None
+    token = _load_token()
+    if not token:
+        return None
+    kc = KiteConnect(api_key=API_KEY)
+    kc.set_access_token(token)
+    return kc
+
+
+def portfolio_ready():
+    """True when Kite is authorised for today (so holdings/positions can be read),
+    regardless of whether Kite or yfinance is the chart data source."""
+    return _authed_kite() is not None
+
+
+def holdings():
+    """Long-term/delivery holdings as a normalised list, or None on failure.
+
+    Each item: {symbol, exchange, qty, avg_price, last_price, kind='holding'}.
+    """
+    kc = _authed_kite()
+    if kc is None:
+        return None
+    try:
+        raw = kc.holdings() or []
+    except Exception as e:
+        print(f'[kite] holdings failed: {e}')
+        return None
+    out = []
+    for h in raw:
+        # t1_quantity = bought but not yet settled into demat; count it as held.
+        qty = int(h.get('quantity', 0) or 0) + int(h.get('t1_quantity', 0) or 0)
+        if qty <= 0:
+            continue
+        out.append({
+            'symbol': (h.get('tradingsymbol') or '').upper(),
+            'exchange': (h.get('exchange') or 'NSE').upper(),
+            'qty': qty,
+            'avg_price': float(h.get('average_price') or 0),
+            'last_price': float(h.get('last_price') or 0),
+            'kind': 'holding',
+        })
+    return out
+
+
+def positions():
+    """Open net intraday + F&O positions (qty != 0) as a normalised list, or None.
+
+    Longs only — the app's risk model (entry/stop/R) is long-only, so short
+    positions (qty < 0) are skipped by the caller.
+    """
+    kc = _authed_kite()
+    if kc is None:
+        return None
+    try:
+        raw = (kc.positions() or {}).get('net', []) or []
+    except Exception as e:
+        print(f'[kite] positions failed: {e}')
+        return None
+    out = []
+    for p in raw:
+        qty = int(p.get('quantity', 0) or 0)
+        if qty == 0:
+            continue
+        out.append({
+            'symbol': (p.get('tradingsymbol') or '').upper(),
+            'exchange': (p.get('exchange') or 'NSE').upper(),
+            'qty': qty,
+            'avg_price': float(p.get('average_price') or 0),
+            'last_price': float(p.get('last_price') or 0),
+            'kind': 'position',
+        })
+    return out
+
+
+def gtt_stops():
+    """Map {'EXCH:SYMBOL': stop_trigger} from active SELL GTT orders (best effort).
+
+    A stop-loss on a long is a SELL GTT triggering below the market; for an OCO
+    (target + stop) the lower trigger is the stop, so we take the minimum.
+    """
+    kc = _authed_kite()
+    if kc is None:
+        return {}
+    try:
+        gtts = kc.get_gtts() or []
+    except Exception as e:
+        print(f'[kite] get_gtts failed: {e}')
+        return {}
+    out = {}
+    for g in gtts:
+        try:
+            if g.get('status') != 'active':
+                continue
+            cond = g.get('condition') or {}
+            sym = (cond.get('tradingsymbol') or '').upper()
+            exch = (cond.get('exchange') or 'NSE').upper()
+            triggers = [float(t) for t in (cond.get('trigger_values') or [])]
+            is_sell = any((o.get('transaction_type') == 'SELL') for o in (g.get('orders') or []))
+            if sym and triggers and is_sell:
+                out[f'{exch}:{sym}'] = min(triggers)
+        except Exception:
+            continue
+    return out
+
+
+def sell_fills_today():
+    """Map {'EXCH:SYMBOL': qty_weighted_avg_sell_price} from today's SELL trades."""
+    kc = _authed_kite()
+    if kc is None:
+        return {}
+    try:
+        trades = kc.trades() or []
+    except Exception as e:
+        print(f'[kite] trades failed: {e}')
+        return {}
+    agg = {}  # key -> [value_sum, qty_sum]
+    for t in trades:
+        if (t.get('transaction_type') or '').upper() != 'SELL':
+            continue
+        sym = (t.get('tradingsymbol') or '').upper()
+        exch = (t.get('exchange') or 'NSE').upper()
+        price = float(t.get('average_price') or t.get('price') or 0)
+        qty = float(t.get('quantity') or 0)
+        if not sym or qty <= 0 or price <= 0:
+            continue
+        a = agg.setdefault(f'{exch}:{sym}', [0.0, 0.0])
+        a[0] += price * qty
+        a[1] += qty
+    return {k: (v[0] / v[1]) for k, v in agg.items() if v[1] > 0}
+
+
+def last_price(exchange, symbol):
+    """Single LTP via the portfolio-authed client (independent of DATA_SOURCE)."""
+    kc = _authed_kite()
+    if kc is None:
+        return None
+    key = f'{(exchange or "NSE").upper()}:{symbol.upper()}'
+    try:
+        d = kc.ltp([key])
+        return float(d[key]['last_price']) if key in d else None
+    except Exception:
+        return None
