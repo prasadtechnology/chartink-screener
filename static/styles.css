@@ -336,6 +336,44 @@ body { position: relative; overflow-x: hidden; }
 .btn-arrow { transition: transform 0.2s; }
 .btn-primary:hover .btn-arrow { transform: translateX(2px); }
 
+/* ---------- Kite connect / sync pill buttons ---------- */
+.btn-kite {
+  display: inline-flex; align-items: center; gap: 0.45rem;
+  padding: 0.5rem 0.95rem;
+  font-family: var(--font-sans);
+  font-size: 0.8rem; font-weight: 600; line-height: 1;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  cursor: pointer; white-space: nowrap;
+  transition: transform 0.15s, box-shadow 0.15s, background 0.15s,
+              border-color 0.15s, color 0.15s;
+}
+.btn-kite svg { width: 15px; height: 15px; flex-shrink: 0; }
+.btn-kite:disabled { opacity: 0.6; cursor: default; transform: none; box-shadow: none; }
+/* Connect — prominent filled CTA */
+.btn-kite--connect {
+  color: #fff;
+  background: linear-gradient(135deg, var(--accent), var(--accent-hover));
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--accent) 32%, transparent);
+}
+.btn-kite--connect:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 5px 16px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+/* Sync — refined outline that fills on hover; icon spins */
+.btn-kite--sync {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 28%, transparent);
+}
+.btn-kite--sync:hover:not(:disabled) {
+  transform: translateY(-1px);
+  color: #fff; background: var(--accent); border-color: var(--accent);
+  box-shadow: 0 4px 12px color-mix(in srgb, var(--accent) 32%, transparent);
+}
+.btn-kite--sync svg { transition: transform 0.5s ease; }
+.btn-kite--sync:hover:not(:disabled) svg { transform: rotate(-180deg); }
+
 /* ---------- Progress ---------- */
 .progress-section { padding-top: 1rem; }
 .progress-count { font-family: var(--font-mono); font-size: 0.85rem; color: var(--accent); font-weight: 500; }

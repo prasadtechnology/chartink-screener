@@ -2691,11 +2691,17 @@ function showConnectButton() {
   $('syncKiteBtn')?.classList.add('hidden');
   $('connectKiteBtn')?.classList.remove('hidden');
 }
+// Update only the button's text label, preserving its SVG icon.
+function setBtnLabel(btn, text) {
+  if (!btn) return;
+  const lbl = btn.querySelector('.btn-label');
+  if (lbl) lbl.textContent = text; else btn.textContent = text;
+}
 
 // Browser login via the hosted Kite MCP — no API key/secret, read-only.
 async function connectKite() {
   const btn = $('connectKiteBtn');
-  if (btn) { btn.disabled = true; btn.textContent = 'Opening Kite…'; }
+  if (btn) { btn.disabled = true; setBtnLabel(btn, 'Opening Kite…'); }
   try {
     const j = await (await fetch('/api/kite_mcp/login', { method: 'POST' })).json();
     if (!j.login_url) throw new Error(j.error || 'could not start login');
@@ -2710,12 +2716,12 @@ async function connectKite() {
         kiteMode = 'mcp'; showSyncButton(); syncKite({ silent: false });
       } else if (Date.now() - started > 180000) {   // give up after 3 min
         clearInterval(poll);
-        if (btn) { btn.disabled = false; btn.textContent = '🔗 Connect Kite'; }
+        if (btn) { btn.disabled = false; setBtnLabel(btn, 'Connect Kite'); }
       }
     }, 2500);
   } catch (e) {
     showToast('Kite connect failed: ' + e.message, 'error');
-    if (btn) { btn.disabled = false; btn.textContent = '🔗 Connect Kite'; }
+    if (btn) { btn.disabled = false; setBtnLabel(btn, 'Connect Kite'); }
   }
 }
 
@@ -2723,7 +2729,7 @@ async function connectKite() {
 async function syncKite({ silent = false } = {}) {
   const endpoint = kiteMode === 'mcp' ? '/api/kite_mcp/sync' : '/api/holdings/sync_kite';
   const btn = $('syncKiteBtn');
-  if (btn) { btn.disabled = true; btn.textContent = 'Syncing…'; }
+  if (btn) { btn.disabled = true; setBtnLabel(btn, 'Syncing…'); }
   try {
     const res = await fetch(endpoint, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -2756,7 +2762,7 @@ async function syncKite({ silent = false } = {}) {
   } catch (e) {
     if (!silent) showToast('Kite sync failed: ' + e.message, 'error');
   } finally {
-    if (btn) { btn.disabled = false; btn.textContent = '⟳ Sync from Kite'; }
+    if (btn) { btn.disabled = false; setBtnLabel(btn, 'Sync from Kite'); }
   }
 }
 $('connectKiteBtn')?.addEventListener('click', connectKite);
