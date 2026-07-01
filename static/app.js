@@ -175,6 +175,84 @@ dropzone.addEventListener('drop', (e) => {
 });
 fileInput.addEventListener('change', (e) => handleFiles(e.target.files));
 
+// ---------------------------------------------------------------------------
+// Scan session persistence — keep today's processed CSVs across reloads
+// ---------------------------------------------------------------------------
+// The expensive per-symbol screen results are already cached server-side for
+// the day. Here we persist the *frontend session* (which symbols were uploaded,
+// the parse summary, and the rendered results) so a page reload restores the
+// last scan instead of dropping the user back at the upload screen. Stamped with
+// the local date, so it self-expires at the start of a new trading day.
+const SCAN_SESSION_KEY = 'vcp_scan_session_v1';
+function scanDayStr() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+function saveScanSession(withResults) {
+  try {
+    if (!state.symbols || !state.symbols.length) return;
+    const payload = { date: scanDayStr(), symbols: state.symbols, summary: state._parseSummary || null };
+    if (withResults) payload.results = state.results;
+    try {
+      localStorage.setItem(SCAN_SESSION_KEY, JSON.stringify(payload));
+    } catch (quota) {
+      // Over the storage quota (very large batch incl. chart data) — fall back to
+      // persisting just the symbol list + summary so the upload is still remembered;
+      // a re-scan then hits the server's day cache and is fast.
+      delete payload.results;
+      try { localStorage.setItem(SCAN_SESSION_KEY, JSON.stringify(payload)); } catch (_) {}
+    }
+  } catch (_) { /* localStorage unavailable — non-fatal */ }
+}
+function loadScanSession() {
+  try {
+    const raw = localStorage.getItem(SCAN_SESSION_KEY);
+    if (!raw) return null;
+    const s = JSON.parse(raw);
+    if (!s || !Array.isArray(s.symbols) || !s.symbols.length) return null;
+    if (s.date !== scanDayStr()) { localStorage.removeItem(SCAN_SESSION_KEY); return null; } // new day
+    return s;
+  } catch (_) { return null; }
+}
+function clearScanSession() {
+  try { localStorage.removeItem(SCAN_SESSION_KEY); } catch (_) {}
+}
+function restoreScanSession() {
+  const s = loadScanSession();
+  if (!s) return false;
+  state.symbols = s.symbols;
+  state._parseSummary = s.summary || null;
+  renderParseSummary(s.summary);
+  const results = Array.isArray(s.results) ? s.results : [];
+  state.results = results;
+  if (results.length) {
+    $('resultsContainer').innerHTML = '';
+    $('rejectedGrid').innerHTML = '';
+    $('rejectedSection').classList.add('hidden');
+    results.forEach(r => appendCardByCategory(r));
+    sortAndRerender();
+    showToast(`Restored today's scan — ${results.length} symbol${results.length === 1 ? '' : 's'} already processed.`, 'info');
+  } else {
+    showToast(`Restored ${s.symbols.length} symbol${s.symbols.length === 1 ? '' : 's'} from today's upload — hit Screen to scan.`, 'info');
+  }
+  return true;
+}
+
+// Render the parse-summary panel from a saved/just-parsed summary object.
+function renderParseSummary(summary) {
+  if (!summary) return;
+  $('statFiles').textContent = summary.total_files;
+  $('statRaw').textContent = summary.total_raw;
+  $('statDups').textContent = summary.duplicates_removed;
+  $('statUnique').textContent = summary.unique_count;
+  $('perFile').innerHTML = (summary.per_file || []).map(f =>
+    `<div class="file-detail-row"><span>${esc(f.filename)}</span><span class="mono">${f.count} symbols</span></div>`
+  ).join('');
+  parseSection.classList.remove('hidden');
+  heroSection.classList.add('hidden');
+  document.getElementById('scanEmpty')?.classList.add('hidden');
+}
+
 async function handleFiles(files) {
   if (!files || files.length === 0) return;
   setStatus('active', 'Parsing CSVs…');
@@ -188,21 +266,14 @@ async function handleFiles(files) {
     if (data.error) throw new Error(data.error);
 
     state.symbols = data.symbols;
-
-    $('statFiles').textContent = data.total_files;
-    $('statRaw').textContent = data.total_raw;
-    $('statDups').textContent = data.duplicates_removed;
-    $('statUnique').textContent = data.unique_count;
-
-    const perFileHtml = data.per_file.map(f =>
-      `<div class="file-detail-row"><span>${f.filename}</span><span class="mono">${f.count} symbols</span></div>`
-    ).join('');
-    $('perFile').innerHTML = perFileHtml;
-
-    parseSection.classList.remove('hidden');
-    heroSection.classList.add('hidden');
-    document.getElementById('scanEmpty')?.classList.add('hidden');
+    state._parseSummary = {
+      total_files: data.total_files, total_raw: data.total_raw,
+      duplicates_removed: data.duplicates_removed, unique_count: data.unique_count,
+      per_file: data.per_file,
+    };
+    renderParseSummary(state._parseSummary);
     parseSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    saveScanSession(false);   // remember the upload for the day (results saved after scan)
     setStatus('done', 'Parsed');
   } catch (err) {
     setStatus('error', 'Parse failed');
@@ -213,6 +284,7 @@ async function handleFiles(files) {
 $('resetBtn').addEventListener('click', () => {
   state.symbols = [];
   state.results = [];
+  clearScanSession();
   fileInput.value = '';
   parseSection.classList.add('hidden');
   heroSection.classList.remove('hidden');
@@ -771,6 +843,7 @@ async function runScreen() {
   // Auto-collapse the screening progress section once done — it's noise after this point
   setTimeout(() => progressSection.classList.add('hidden'), 800);
   sortAndRerender();
+  saveScanSession(true);   // persist today's processed results for restore-on-reload
 }
 
 // ---------------------------------------------------------------------------
@@ -2592,8 +2665,10 @@ async function initKite() {
   } catch (e) { /* leave hidden on error */ }
 }
 initKite();
-// Load custom sections in parallel — they may be empty for new users
-loadCustomSections();
+// Load custom sections in parallel — they may be empty for new users — then
+// restore today's already-processed scan (if any) once sections are available,
+// so custom tabs like "No data" render correctly.
+loadCustomSections().then(() => { try { restoreScanSession(); } catch (_) {} });
 
 // ---------------------------------------------------------------------------
 // Top nav: Scan / Holdings
