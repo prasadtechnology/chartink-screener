@@ -261,9 +261,15 @@
 
 <!-- ================= JOURNAL VIEW ================= -->
 <div class="view hidden" id="journalView">
-  <section class="page-intro">
-    <h1 class="page-title">Journal</h1>
-    <p class="page-sub">Performance across every closed trade — win rate, expectancy, streaks, drawdown and more.</p>
+  <section class="page-intro page-intro--row">
+    <div>
+      <h1 class="page-title">Journal</h1>
+      <p class="page-sub">Performance across every closed trade — win rate, expectancy, streaks, drawdown and more.</p>
+    </div>
+    <button class="btn-kite btn-kite--sync hidden" id="pullJournalBtn" title="Import today's executed trades from Kite as round-trip journal entries. Read-only — no orders are placed.">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 12 5 5 5-5"/><path d="M5 21h14"/></svg>
+      <span class="btn-label">Pull today's trades</span>
+    </button>
   </section>
   <div id="journalBody"></div>
 </div>

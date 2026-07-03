@@ -98,6 +98,7 @@ def init_db():
                 opened_at INTEGER,
                 closed_at INTEGER NOT NULL,
                 notes TEXT,
+                external_id TEXT,
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_closed_user ON closed_positions(user_id);
@@ -147,6 +148,15 @@ def init_db():
         # Provenance of a holding: 'manual' or 'kite' (added for Kite portfolio sync).
         if _table_exists(conn, 'holdings') and not _column_exists(conn, 'holdings', 'source'):
             conn.execute("ALTER TABLE holdings ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")
+        # Dedup key for trades imported from Kite ("Pull journal from Kite").
+        # Add the column first (older DBs lack it), then build the unique index —
+        # doing it here (not in the CREATE block above) guarantees the column
+        # exists for both fresh and upgraded databases before the index is built.
+        if _table_exists(conn, 'closed_positions'):
+            if not _column_exists(conn, 'closed_positions', 'external_id'):
+                conn.execute("ALTER TABLE closed_positions ADD COLUMN external_id TEXT")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_closed_ext "
+                         "ON closed_positions(user_id, external_id) WHERE external_id IS NOT NULL")
 
 
 # ---------------- Chart cache (shared across users) ----------------
@@ -522,6 +532,34 @@ def clear_drawings(user_id, symbol):
 
 
 # ---------------- Closed positions ----------------
+def add_closed_trade(user_id, t):
+    """Insert a fully-specified closed round-trip trade, deduped by external_id.
+
+    Used by the "Pull journal from Kite" import. Returns 'added', or 'skipped'
+    when a trade with the same external_id already exists for this user.
+    """
+    ext = t.get('external_id')
+    with get_conn() as conn:
+        if ext:
+            exists = conn.execute(
+                'SELECT 1 FROM closed_positions WHERE user_id = ? AND external_id = ?',
+                (user_id, ext)
+            ).fetchone()
+            if exists:
+                return 'skipped'
+        conn.execute(
+            'INSERT INTO closed_positions '
+            '(user_id, symbol, exchange, entry, exit, stop, qty, pnl, r_multiple, '
+            'opened_at, closed_at, notes, external_id) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (user_id, t['symbol'], (t.get('exchange') or 'NSE').upper(),
+             float(t['entry']), float(t['exit']), float(t['stop']), int(t['qty']),
+             float(t['pnl']), float(t['r_multiple']), t.get('opened_at'),
+             int(t['closed_at']), t.get('notes'), ext)
+        )
+        return 'added'
+
+
 def list_closed_positions(user_id, limit=200):
     with get_conn() as conn:
         rows = conn.execute(

@@ -10,8 +10,10 @@ blocks those tools anyway). Communication is plain JSON-RPC over the streamable
 HTTP transport; the MCP session id (returned by `initialize`) is reused across
 otherwise-stateless requests, which is exactly what a web backend needs.
 """
+import datetime as _dt
 import json
 import re
+import time
 
 import requests
 
@@ -217,6 +219,50 @@ def sell_fills_today(session_id):
         a[0] += price * qty
         a[1] += qty
     return {k: (v[0] / v[1]) for k, v in agg.items() if v[1] > 0}
+
+
+def _epoch(v):
+    """Best-effort convert a Kite timestamp (string or number) to epoch seconds."""
+    if v is None:
+        return int(time.time())
+    if isinstance(v, (int, float)):
+        return int(v)
+    s = str(v).strip()[:19]
+    for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M'):
+        try:
+            return int(_dt.datetime.strptime(s, fmt).timestamp())
+        except Exception:
+            continue
+    return int(time.time())
+
+
+def trades_today(session_id):
+    """Today's executed trades (BUY and SELL) as a normalised list, or None.
+
+    Read-only. Same shape as kite_data.trades_today so the journal import is
+    source-agnostic. Kite exposes only the current day's tradebook.
+    """
+    raw = _call_tool_json(session_id, 'get_trades')
+    if raw is None:
+        return None
+    out = []
+    for t in raw:
+        sym = (t.get('tradingsymbol') or '').upper()
+        exch = (t.get('exchange') or 'NSE').upper()
+        typ = (t.get('transaction_type') or '').upper()
+        qty = float(t.get('quantity') or 0)
+        price = float(t.get('average_price') or t.get('price') or 0)
+        if not sym or typ not in ('BUY', 'SELL') or qty <= 0 or price <= 0:
+            continue
+        out.append({
+            'trade_id': str(t.get('trade_id') or t.get('order_id') or ''),
+            'order_id': str(t.get('order_id') or ''),
+            'symbol': sym, 'exchange': exch, 'type': typ,
+            'qty': qty, 'price': price,
+            'ts': _epoch(t.get('fill_timestamp') or t.get('exchange_timestamp')
+                         or t.get('order_timestamp')),
+        })
+    return out
 
 
 def last_price(session_id, exchange, symbol):

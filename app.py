@@ -547,6 +547,132 @@ def kite_mcp_sync():
     return jsonify({'ok': True, **res})
 
 
+# --- Pull journal from Kite: today's fills -> round-trip closed trades ---------
+def _holding_lookup(uid):
+    """Return a fn (exchange, symbol) -> holding row, for entry/stop fallback.
+
+    A SELL of a delivery position opened before today has no BUY leg in today's
+    tradebook; we price its entry from the app's tracked holding instead.
+    """
+    idx = {f"{h['exchange']}:{h['symbol']}": h for h in db.list_holdings(uid)}
+    return lambda exchange, symbol: idx.get(f"{exchange}:{symbol}")
+
+
+def build_round_trips(trades, holding_lookup):
+    """Turn today's Kite fills into completed round-trip trades (one per SELL).
+
+    Per symbol, FIFO-matches each SELL against earlier BUY fills the same day.
+    Any excess sell quantity (a position opened before today) falls back to the
+    app's tracked holding entry/stop so the exit still journals with a real R.
+    A SELL with nothing to match against (e.g. a short) is skipped. Returns a
+    list of closed-trade dicts ready for db.add_closed_trade.
+    """
+    from collections import defaultdict, deque
+    by_key = defaultdict(list)
+    for t in trades:
+        by_key[f"{t['exchange']}:{t['symbol']}"].append(t)
+
+    out = []
+    for key, fills in by_key.items():
+        exch, sym = key.split(':', 1)
+        fills.sort(key=lambda x: x['ts'])
+        buys = deque()                      # FIFO lots: [qty, price, ts]
+        h = holding_lookup(exch, sym)
+        fb_qty = float(h['qty']) if h else 0.0
+        fb_entry = float(h['entry']) if h else None
+        fb_stop = float(h['stop']) if h else None
+        fb_opened = h.get('opened_at') if h else None
+
+        for t in fills:
+            if t['type'] == 'BUY':
+                buys.append([t['qty'], t['price'], t['ts']])
+                continue
+            # SELL -> assemble one round trip
+            remaining = t['qty']
+            cost = matched = 0.0
+            opened_at = None
+            while remaining > 1e-9 and buys:
+                lot = buys[0]
+                take = min(remaining, lot[0])
+                cost += take * lot[1]
+                matched += take
+                if opened_at is None:
+                    opened_at = lot[2]
+                lot[0] -= take
+                remaining -= take
+                if lot[0] <= 1e-9:
+                    buys.popleft()
+            used_fallback = False
+            if remaining > 1e-9 and fb_entry is not None and fb_qty > 1e-9:
+                take = min(remaining, fb_qty)
+                cost += take * fb_entry
+                matched += take
+                fb_qty -= take
+                remaining -= take
+                used_fallback = True
+                if opened_at is None:
+                    opened_at = fb_opened
+            if matched <= 1e-9:
+                continue                    # unmatched sell (short / unknown) -> skip
+            entry = cost / matched
+            stop = fb_stop if (used_fallback and fb_stop is not None) else entry
+            risk = entry - stop
+            exit_p = t['price']
+            pnl = (exit_p - entry) * matched
+            r_mult = (exit_p - entry) / risk if risk > 0 else 0
+            out.append({
+                'symbol': sym, 'exchange': exch,
+                'entry': round(entry, 2), 'exit': round(exit_p, 2),
+                'stop': round(stop, 2), 'qty': int(round(matched)),
+                'pnl': round(pnl, 2), 'r_multiple': round(r_mult, 2),
+                'opened_at': opened_at or t['ts'], 'closed_at': t['ts'],
+                'notes': 'Imported from Kite',
+                'external_id': f"kite:{t['trade_id']}" if t.get('trade_id') else None,
+            })
+    return out
+
+
+def run_journal_import(uid, trades):
+    """Build round trips from today's fills and upsert them into the journal."""
+    trips = build_round_trips(trades, _holding_lookup(uid))
+    added = skipped = 0
+    imported = []
+    for t in trips:
+        if db.add_closed_trade(uid, t) == 'added':
+            added += 1
+            imported.append({'symbol': t['symbol'], 'pnl': t['pnl'],
+                             'r_multiple': t['r_multiple']})
+        else:
+            skipped += 1
+    return {'added': added, 'skipped': skipped, 'trades': len(trades),
+            'imported': imported}
+
+
+@app.route('/api/kite/journal', methods=['POST'])
+@login_required
+def kite_journal():
+    """Import today's trades via Kite Connect (API key/secret) into the journal."""
+    if not kite_data.portfolio_ready():
+        return jsonify({'error': 'kite_not_connected'}), 400
+    trades = kite_data.trades_today()
+    if trades is None:
+        return jsonify({'error': 'kite_fetch_failed'}), 502
+    return jsonify({'ok': True, **run_journal_import(current_user_id(), trades)})
+
+
+@app.route('/api/kite_mcp/journal', methods=['POST'])
+@login_required
+def kite_mcp_journal():
+    """Import today's trades via the browser-login Kite MCP session."""
+    sid = session.get('kite_mcp_sid')
+    if not sid:
+        return jsonify({'error': 'not_connected'}), 400
+    trades = kite_mcp.trades_today(sid)
+    if trades is None:
+        return jsonify({'error': 'not_authenticated'}), 401
+    return jsonify({'ok': True, **run_journal_import(current_user_id(), trades)})
+
+
 def compute_journal_stats(rows):
     """Rich trading-journal metrics from closed positions.
 

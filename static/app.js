@@ -2685,10 +2685,12 @@ async function initKite() {
 function showSyncButton() {
   $('connectKiteBtn')?.classList.add('hidden');
   $('syncKiteBtn')?.classList.remove('hidden');
+  $('pullJournalBtn')?.classList.remove('hidden');   // journal import needs Kite connected
 }
 function showConnectButton() {
   kiteMode = null;
   $('syncKiteBtn')?.classList.add('hidden');
+  $('pullJournalBtn')?.classList.add('hidden');
   $('connectKiteBtn')?.classList.remove('hidden');
 }
 // Update only the button's text label, preserving its SVG icon.
@@ -2765,8 +2767,41 @@ async function syncKite({ silent = false } = {}) {
     if (btn) { btn.disabled = false; setBtnLabel(btn, 'Sync from Kite'); }
   }
 }
+// Pull today's Kite trades into the journal as round-trip closed trades.
+async function pullKiteJournal() {
+  const endpoint = kiteMode === 'mcp' ? '/api/kite_mcp/journal' : '/api/kite/journal';
+  const btn = $('pullJournalBtn');
+  if (btn) { btn.disabled = true; setBtnLabel(btn, 'Pulling…'); }
+  try {
+    const res = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      if (j.error === 'not_authenticated' || j.error === 'not_connected' || j.error === 'kite_not_connected') {
+        showConnectButton();
+        showToast('Connect Kite first to pull your trades.', 'info');
+        return;
+      }
+      throw new Error(j.error || 'import failed');
+    }
+    if (j.added) {
+      showToast(`Kite journal — ${j.added} trade${j.added === 1 ? '' : 's'} imported${j.skipped ? `, ${j.skipped} already logged` : ''}.`, 'success');
+    } else if (j.trades === 0) {
+      showToast('No executed trades in Kite today.', 'info');
+    } else {
+      showToast('Journal already up to date — no new round-trip trades.', 'info');
+    }
+    await refreshNavCount();
+    if (!$('journalView')?.classList.contains('hidden')) renderJournal();
+  } catch (e) {
+    showToast('Kite journal import failed: ' + e.message, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; setBtnLabel(btn, "Pull today's trades"); }
+  }
+}
+
 $('connectKiteBtn')?.addEventListener('click', connectKite);
 $('syncKiteBtn')?.addEventListener('click', () => syncKite({ silent: false }));
+$('pullJournalBtn')?.addEventListener('click', pullKiteJournal);
 
 initKite();
 // Load custom sections in parallel — they may be empty for new users — then

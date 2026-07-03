@@ -312,6 +312,66 @@ def sell_fills_today():
     return {k: (v[0] / v[1]) for k, v in agg.items() if v[1] > 0}
 
 
+def _epoch(v):
+    """Best-effort convert a Kite timestamp (datetime or string) to epoch seconds."""
+    if v is None:
+        return int(_dt.datetime.now().timestamp())
+    if isinstance(v, (int, float)):
+        return int(v)
+    if hasattr(v, 'timestamp'):
+        try:
+            return int(v.timestamp())
+        except Exception:
+            return int(_dt.datetime.now().timestamp())
+    s = str(v).strip()[:19]
+    for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M'):
+        try:
+            return int(_dt.datetime.strptime(s, fmt).timestamp())
+        except Exception:
+            continue
+    return int(_dt.datetime.now().timestamp())
+
+
+def _normalise_trades(raw):
+    """Normalise Kite trade records to {trade_id, order_id, symbol, exchange,
+    type, qty, price, ts}. BUY/SELL only; skips malformed rows."""
+    out = []
+    for t in (raw or []):
+        sym = (t.get('tradingsymbol') or '').upper()
+        exch = (t.get('exchange') or 'NSE').upper()
+        typ = (t.get('transaction_type') or '').upper()
+        qty = float(t.get('quantity') or 0)
+        price = float(t.get('average_price') or t.get('price') or 0)
+        if not sym or typ not in ('BUY', 'SELL') or qty <= 0 or price <= 0:
+            continue
+        out.append({
+            'trade_id': str(t.get('trade_id') or t.get('order_id') or ''),
+            'order_id': str(t.get('order_id') or ''),
+            'symbol': sym, 'exchange': exch, 'type': typ,
+            'qty': qty, 'price': price,
+            'ts': _epoch(t.get('fill_timestamp') or t.get('exchange_timestamp')
+                         or t.get('order_timestamp')),
+        })
+    return out
+
+
+def trades_today():
+    """Today's executed trades (BUY and SELL) as a normalised list, or None.
+
+    Powers the "Pull journal from Kite" feature. Read-only. Kite Connect only
+    exposes the *current day's* tradebook, so this returns today's fills only.
+    """
+    kc = _authed_kite()
+    if kc is None:
+        return None
+    try:
+        raw = kc.trades() or []
+    except Exception as e:
+        print(f'[kite] trades failed: {e}')
+        return None
+    return _normalise_trades(raw)
+
+
 def last_price(exchange, symbol):
     """Single LTP via the portfolio-authed client (independent of DATA_SOURCE)."""
     kc = _authed_kite()

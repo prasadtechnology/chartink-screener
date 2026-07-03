@@ -2042,6 +2042,13 @@ body { position: relative; overflow-x: hidden; }
 @media (max-width: 720px) {
   .page-intro { grid-template-columns: 1fr; }
 }
+/* Journal header: title on the left, "Pull today's trades" on the right. */
+.page-intro--row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 1rem;
+}
 .intro-left .page-title {
   margin-bottom: 0.25rem;
 }
