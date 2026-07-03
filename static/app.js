@@ -2815,9 +2815,11 @@ loadCustomSections().then(() => { try { restoreScanSession(); } catch (_) {} });
 // ---------------------------------------------------------------------------
 // Trading journal — performance metrics over all closed trades
 // ---------------------------------------------------------------------------
-function jrMoney(v) {
+function jrMoney(v, { glyph = true } = {}) {
   const n = Math.round(v || 0);
-  return (n < 0 ? '−₹' : '₹') + Math.abs(n).toLocaleString('en-IN');
+  const body = (n < 0 ? '−₹' : '₹') + Math.abs(n).toLocaleString('en-IN');
+  if (!glyph || n === 0) return body;
+  return `<span class="pnl-glyph">${n > 0 ? '▲' : '▼'}</span>${body}`;
 }
 function jrCard(label, value, cls) {
   return `<div class="jr-card"><span class="jr-card-l">${label}</span><span class="jr-card-v ${cls || ''}">${value}</span></div>`;
@@ -2835,11 +2837,18 @@ function jrEquitySvg(equity, colors) {
     ` L${X(n - 1).toFixed(1)},${Y(min).toFixed(1)} Z`;
   const col = vals[n - 1] >= 0 ? colors.pos : colors.neg;
   const zeroY = Y(0).toFixed(1);
-  return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" class="jr-eq-svg" role="img" aria-label="Equity curve">
+  // Approx path length so the CSS draw-in animation reveals the whole line.
+  let len = 0;
+  for (let i = 1; i < n; i++) {
+    len += Math.hypot(X(i) - X(i - 1), Y(equity[i].pnl) - Y(equity[i - 1].pnl));
+  }
+  const dotX = X(n - 1).toFixed(1), dotY = Y(vals[n - 1]).toFixed(1);
+  return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" class="jr-eq-svg draw" style="--eq-len:${Math.ceil(len)}" role="img" aria-label="Equity curve">
     <defs><linearGradient id="jreq" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${col}" stop-opacity="0.28"/><stop offset="1" stop-color="${col}" stop-opacity="0"/></linearGradient></defs>
     <line x1="0" y1="${zeroY}" x2="${w}" y2="${zeroY}" stroke="${colors.border}" stroke-width="1" stroke-dasharray="4 4"/>
     <path d="${area}" fill="url(#jreq)"/>
-    <polyline points="${pts}" fill="none" stroke="${col}" stroke-width="2"/>
+    <polyline points="${pts}" fill="none" stroke="${col}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+    <circle class="jr-eq-dot" cx="${dotX}" cy="${dotY}" r="3.2" fill="${col}"/>
   </svg>`;
 }
 
@@ -3003,6 +3012,14 @@ function renderSectorsView() {
   body.dataset.ready = '1';
 }
 
+// Re-trigger the CSS view-enter animation on a freshly shown view.
+function playViewEnter(el) {
+  if (!el) return;
+  el.classList.remove('view-enter');
+  void el.offsetWidth;            // force reflow so the animation restarts
+  el.classList.add('view-enter');
+}
+
 document.querySelectorAll('.nav-tab').forEach(t => {
   t.addEventListener('click', () => {
     document.querySelectorAll('.nav-tab').forEach(x => x.classList.remove('active'));
@@ -3015,8 +3032,35 @@ document.querySelectorAll('.nav-tab').forEach(t => {
     if (view === 'holdings') renderHoldings();
     if (view === 'journal') renderJournal();
     if (view === 'sectors') renderSectorsView();
+    playViewEnter($(view + 'View'));
   });
 });
+
+// ---------------------------------------------------------------------------
+// Animated count-up for numeric readouts. Honours prefers-reduced-motion.
+// Preserves prefix/suffix (₹, %, R) and thousands separators.
+// ---------------------------------------------------------------------------
+function animateCount(el, toText, { duration = 650 } = {}) {
+  if (!el) return;
+  const reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const m = String(toText).match(/-?[\d,]*\.?\d+/);
+  if (reduce || !m) { el.textContent = toText; return; }
+  const target = parseFloat(m[0].replace(/,/g, ''));
+  const pre = toText.slice(0, m.index);
+  const post = toText.slice(m.index + m[0].length);
+  const decimals = (m[0].split('.')[1] || '').length;
+  const intl = new Intl.NumberFormat('en-IN', { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+  const start = performance.now();
+  el.classList.add('tick');
+  function frame(now) {
+    const p = Math.min(1, (now - start) / duration);
+    const eased = 1 - Math.pow(1 - p, 3);              // easeOutCubic
+    el.textContent = pre + intl.format(target * eased) + post;
+    if (p < 1) requestAnimationFrame(frame);
+    else { el.textContent = toText; setTimeout(() => el.classList.remove('tick'), 320); }
+  }
+  requestAnimationFrame(frame);
+}
 
 // ---------------------------------------------------------------------------
 // Symbol search — look up any symbol and open its chart, no CSV required
@@ -3240,9 +3284,10 @@ function renderHoldingsTable(data) {
 
   const pnlCls = (s.total_pnl || 0) >= 0 ? 'pos' : 'neg';
   const fmt = (v) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
-  $('hsPositions').textContent = s.positions || 0;
-  $('hsInvested').textContent = fmt(s.total_invested);
-  $('hsPnl').innerHTML = `<span class="${pnlCls}">${(s.total_pnl||0) >= 0 ? '+' : ''}${fmt(s.total_pnl).replace('₹-','-₹')}</span> <span style="font-size:0.75rem;color:var(--text-faint);margin-left:0.3rem">${s.total_pnl_pct > 0 ? '+' : ''}${s.total_pnl_pct}%</span>`;
+  animateCount($('hsPositions'), String(s.positions || 0));
+  animateCount($('hsInvested'), fmt(s.total_invested));
+  const pnlArrow = (s.total_pnl || 0) > 0 ? '▲' : ((s.total_pnl || 0) < 0 ? '▼' : '');
+  $('hsPnl').innerHTML = `<span class="${pnlCls}">${pnlArrow ? `<span class="pnl-glyph">${pnlArrow}</span>` : ''}${(s.total_pnl||0) >= 0 ? '+' : ''}${fmt(s.total_pnl).replace('₹-','-₹')}</span> <span style="font-size:0.75rem;color:var(--text-faint);margin-left:0.3rem">${s.total_pnl_pct > 0 ? '+' : ''}${s.total_pnl_pct}%</span>`;
   $('hsOpenRisk').innerHTML = `<span class="neg">${fmt(s.total_open_risk)}</span> <span style="font-size:0.75rem;color:var(--text-faint);margin-left:0.3rem">${s.open_risk_pct}% of cap</span>`;
 
   const rowsHtml = rows.map(h => {
