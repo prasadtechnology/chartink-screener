@@ -2670,16 +2670,26 @@ async function initKite() {
   }
 
   // Holdings sync: prefer Kite Connect when authorised, else the browser-login MCP.
+  // autoCapture runs the holdings sync (delivery exits) AND today's intraday pull
+  // so the journal fills itself on open — no clicks. Sync first so a same-day
+  // delivery sale is journaled by it; the pull then adds only intraday trades.
   if (kc.portfolio_ready) {
-    kiteMode = 'connect'; showSyncButton(); syncKite({ silent: true }); return;
+    kiteMode = 'connect'; showSyncButton(); autoCapture(); return;
   }
   let mcp = {};
   try { mcp = await (await fetch('/api/kite_mcp/status')).json(); } catch (_) {}
   if (mcp.connected) {
-    kiteMode = 'mcp'; showSyncButton(); syncKite({ silent: true });
+    kiteMode = 'mcp'; showSyncButton(); autoCapture();
   } else {
     $('connectKiteBtn')?.classList.remove('hidden');   // offer browser login
   }
+}
+
+// Hands-free capture on app open: reconcile holdings + journal today's intraday
+// trades. Both silent; they only toast when something actually changed.
+async function autoCapture() {
+  await syncKite({ silent: true });
+  await pullKiteJournal({ silent: true });
 }
 
 function showSyncButton() {
@@ -2768,7 +2778,7 @@ async function syncKite({ silent = false } = {}) {
   }
 }
 // Pull today's Kite trades into the journal as round-trip closed trades.
-async function pullKiteJournal() {
+async function pullKiteJournal({ silent = false } = {}) {
   const endpoint = kiteMode === 'mcp' ? '/api/kite_mcp/journal' : '/api/kite/journal';
   const btn = $('pullJournalBtn');
   if (btn) { btn.disabled = true; setBtnLabel(btn, 'Pulling…'); }
@@ -2777,31 +2787,76 @@ async function pullKiteJournal() {
     const j = await res.json().catch(() => ({}));
     if (!res.ok) {
       if (j.error === 'not_authenticated' || j.error === 'not_connected' || j.error === 'kite_not_connected') {
-        showConnectButton();
-        showToast('Connect Kite first to pull your trades.', 'info');
+        if (!silent) { showConnectButton(); showToast('Connect Kite first to pull your trades.', 'info'); }
         return;
       }
       throw new Error(j.error || 'import failed');
     }
+    // In silent (auto) mode only speak up when something new was actually added.
     if (j.added) {
-      showToast(`Kite journal — ${j.added} trade${j.added === 1 ? '' : 's'} imported${j.skipped ? `, ${j.skipped} already logged` : ''}.`, 'success');
-    } else if (j.trades === 0) {
-      showToast('No executed trades in Kite today.', 'info');
-    } else {
-      showToast('Journal already up to date — no new round-trip trades.', 'info');
+      showToast(`Kite journal — ${j.added} intraday trade${j.added === 1 ? '' : 's'} added${j.skipped ? `, ${j.skipped} already logged` : ''}.`, 'success');
+    } else if (!silent) {
+      showToast(j.trades === 0 ? 'No executed trades in Kite today.'
+                               : 'Journal already up to date — no new intraday trades.', 'info');
     }
     await refreshNavCount();
     if (!$('journalView')?.classList.contains('hidden')) renderJournal();
   } catch (e) {
-    showToast('Kite journal import failed: ' + e.message, 'error');
+    if (!silent) showToast('Kite journal import failed: ' + e.message, 'error');
   } finally {
     if (btn) { btn.disabled = false; setBtnLabel(btn, "Pull today's trades"); }
+  }
+}
+
+// Import realised P&L from a Kite Console P&L export (xlsx/csv). Console figures
+// are authoritative and supersede any guessed/live-pull rows for the same window.
+async function importConsolePnl(file) {
+  if (!file) return;
+  const btn = $('importConsoleBtn');
+  if (btn) { btn.disabled = true; setBtnLabel(btn, 'Importing…'); }
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    const res = await fetch('/api/journal/import_console', { method: 'POST', body: fd });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      let msg;
+      if (j.error === 'xlsx_support_missing') {
+        msg = 'Excel support isn\'t installed. Run "pip install -r requirements.txt" and restart the app — or upload the report as CSV.';
+      } else if (j.error === 'parse_failed') {
+        msg = "Couldn't read that file — use the P&L export from Console → Reports → P&L (Download)."
+            + (j.detail ? ` (${j.detail})` : '');
+      } else if (j.error === 'no_file') {
+        msg = 'No file selected.';
+      } else {
+        msg = j.error || 'import failed';
+      }
+      showToast(msg, 'error', 7000);
+      return;
+    }
+    if (j.message === 'no_realized_trades') {
+      showToast('No realised (closed) trades in that report — only open holdings.', 'info');
+    } else {
+      const n = (j.added || 0) + (j.updated || 0);
+      const realized = typeof j.realized === 'number'
+        ? ` · realised ${j.realized >= 0 ? '+' : '−'}₹${Math.abs(Math.round(j.realized)).toLocaleString('en-IN')}` : '';
+      showToast(`Console import — ${n} trade${n === 1 ? '' : 's'} (${j.symbols.join(', ')})${realized}.`, 'success', 5000);
+    }
+    await refreshNavCount();
+    if (!$('journalView')?.classList.contains('hidden')) renderJournal();
+  } catch (e) {
+    showToast('Console import failed: ' + e.message, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; setBtnLabel(btn, 'Import Console P&L'); }
+    const inp = $('consoleFileInput'); if (inp) inp.value = '';
   }
 }
 
 $('connectKiteBtn')?.addEventListener('click', connectKite);
 $('syncKiteBtn')?.addEventListener('click', () => syncKite({ silent: false }));
 $('pullJournalBtn')?.addEventListener('click', pullKiteJournal);
+$('importConsoleBtn')?.addEventListener('click', () => $('consoleFileInput')?.click());
+$('consoleFileInput')?.addEventListener('change', (e) => importConsolePnl(e.target.files?.[0]));
 
 initKite();
 // Load custom sections in parallel — they may be empty for new users — then
@@ -2843,13 +2898,60 @@ function jrEquitySvg(equity, colors) {
     len += Math.hypot(X(i) - X(i - 1), Y(equity[i].pnl) - Y(equity[i - 1].pnl));
   }
   const dotX = X(n - 1).toFixed(1), dotY = Y(vals[n - 1]).toFixed(1);
-  return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" class="jr-eq-svg draw" style="--eq-len:${Math.ceil(len)}" role="img" aria-label="Equity curve">
-    <defs><linearGradient id="jreq" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${col}" stop-opacity="0.28"/><stop offset="1" stop-color="${col}" stop-opacity="0"/></linearGradient></defs>
-    <line x1="0" y1="${zeroY}" x2="${w}" y2="${zeroY}" stroke="${colors.border}" stroke-width="1" stroke-dasharray="4 4"/>
-    <path d="${area}" fill="url(#jreq)"/>
-    <polyline points="${pts}" fill="none" stroke="${col}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-    <circle class="jr-eq-dot" cx="${dotX}" cy="${dotY}" r="3.2" fill="${col}"/>
-  </svg>`;
+
+  // Labels are HTML overlaid on the (horizontally stretched) SVG so text stays
+  // crisp and un-distorted. Vertical: the SVG is 200 tall rendered at 200px, so
+  // an SVG y maps 1:1 to px. Horizontal: express x as a % of width.
+  const money = v => (v < 0 ? '−₹' : '₹') + Math.abs(Math.round(v)).toLocaleString('en-IN');
+  const fmtD = t => t ? new Date(t * 1000).toLocaleDateString('en-IN', { day: '2-digit', month: 'short' }) : '';
+  const last = vals[n - 1];
+  const yLbl = (v, cls, txt) => `<span class="jr-eq-yl ${cls}" style="top:${Y(v).toFixed(1)}px">${txt}</span>`;
+  // Per-point data for the hover tooltip (x in %, y in px).
+  const pd = equity.map((e, i) => ({ x: +(X(i) / w * 100).toFixed(2), y: +Y(e.pnl).toFixed(1), p: e.pnl, s: e.symbol || '', d: fmtD(e.t) }));
+
+  return `<div class="jr-eq-wrap" data-eq='${JSON.stringify(pd).replace(/'/g, '&#39;')}'>
+    <svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" class="jr-eq-svg draw" style="--eq-len:${Math.ceil(len)}" role="img" aria-label="Equity curve of cumulative profit and loss">
+      <defs><linearGradient id="jreq" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${col}" stop-opacity="0.28"/><stop offset="1" stop-color="${col}" stop-opacity="0"/></linearGradient></defs>
+      <line x1="0" y1="${zeroY}" x2="${w}" y2="${zeroY}" stroke="${colors.border}" stroke-width="1" stroke-dasharray="4 4"/>
+      <path d="${area}" fill="url(#jreq)"/>
+      <polyline points="${pts}" fill="none" stroke="${col}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+      <circle class="jr-eq-dot" cx="${dotX}" cy="${dotY}" r="3.2" fill="${col}"/>
+    </svg>
+    ${yLbl(max, 'pos', money(max))}
+    ${min < 0 ? yLbl(min, 'neg', money(min)) : ''}
+    ${yLbl(0, 'zero', '₹0')}
+    <span class="jr-eq-cur ${last >= 0 ? 'pos' : 'neg'}" style="top:${dotY}px">${money(last)}</span>
+    <span class="jr-eq-xl" style="left:0">${fmtD(equity[0].t)}</span>
+    <span class="jr-eq-xl" style="right:0">${fmtD(equity[n - 1].t)}</span>
+    <div class="jr-eq-marker hidden"></div>
+    <div class="jr-eq-tip hidden"></div>
+  </div>`;
+}
+
+// Attach hover tooltip to an equity chart: nearest point -> marker + tip.
+function attachEquityHover(root) {
+  const wrap = root.querySelector('.jr-eq-wrap');
+  if (!wrap) return;
+  let pts;
+  try { pts = JSON.parse(wrap.dataset.eq); } catch { return; }
+  if (!pts || !pts.length) return;
+  const marker = wrap.querySelector('.jr-eq-marker');
+  const tip = wrap.querySelector('.jr-eq-tip');
+  const money = v => (v < 0 ? '−₹' : '₹') + Math.abs(Math.round(v)).toLocaleString('en-IN');
+  wrap.addEventListener('mousemove', (e) => {
+    const r = wrap.getBoundingClientRect();
+    const xPct = ((e.clientX - r.left) / r.width) * 100;
+    let best = pts[0], bd = Infinity;
+    for (const p of pts) { const d = Math.abs(p.x - xPct); if (d < bd) { bd = d; best = p; } }
+    marker.style.left = best.x + '%';
+    marker.style.top = best.y + 'px';
+    marker.classList.remove('hidden');
+    tip.innerHTML = `<b>${best.s ? esc(best.s) + ' · ' : ''}</b>${money(best.p)}${best.d ? ` <span>${best.d}</span>` : ''}`;
+    tip.style.left = Math.min(Math.max(best.x, 12), 88) + '%';
+    tip.style.top = Math.max(best.y - 14, 4) + 'px';
+    tip.classList.remove('hidden');
+  });
+  wrap.addEventListener('mouseleave', () => { marker.classList.add('hidden'); tip.classList.add('hidden'); });
 }
 
 async function renderJournal() {
@@ -2884,14 +2986,17 @@ async function renderJournal() {
     border: cs.getPropertyValue('--border-strong').trim() || '#444',
   };
   const cl = v => (v || 0) >= 0 ? 'pos' : 'neg';
+  // R and hold metrics can be "no data" (null) for stop-less imports -> show —.
+  const rTxt = v => (v == null ? '—' : `${v}R`);
+  const clR = v => (v == null ? '' : cl(v));
   const streakTxt = s.current_streak > 0 ? `${s.current_streak}W` : (s.current_streak < 0 ? `${-s.current_streak}L` : '—');
 
   const cards = [
     jrCard('Net P&amp;L', jrMoney(s.total_pnl), cl(s.total_pnl)),
     jrCard('Win rate', `${s.win_rate ?? 0}%`, ''),
     jrCard('Trades', `${s.total_trades} <i>${s.wins}W · ${s.losses}L</i>`, ''),
-    jrCard('Expectancy', `${s.expectancy_r ?? 0}R`, cl(s.expectancy_r)),
-    jrCard('Avg R : R', `${s.avg_rr ?? 0}R`, cl(s.avg_rr)),
+    jrCard('Expectancy', rTxt(s.expectancy_r), clR(s.expectancy_r)),
+    jrCard('Avg R : R', rTxt(s.avg_rr), clR(s.avg_rr)),
     jrCard('Profit factor', `${s.profit_factor ?? 0}`, (s.profit_factor >= 1 ? 'pos' : 'neg')),
     jrCard('Max win streak', `${s.max_win_streak ?? 0}`, 'pos'),
     jrCard('Max loss streak', `${s.max_loss_streak ?? 0}`, 'neg'),
@@ -2899,9 +3004,9 @@ async function renderJournal() {
     jrCard('Max drawdown', jrMoney(-Math.abs(s.max_drawdown || 0)), 'neg'),
     jrCard('Largest win', jrMoney(s.largest_win), 'pos'),
     jrCard('Largest loss', jrMoney(s.largest_loss), 'neg'),
-    jrCard('Avg win', `${s.avg_win_r ?? 0}R`, 'pos'),
-    jrCard('Avg loss', `${s.avg_loss_r ?? 0}R`, 'neg'),
-    jrCard('Avg hold', `${s.avg_hold_days ?? 0}d`, ''),
+    jrCard('Avg win', s.avg_win_amt == null ? '—' : jrMoney(s.avg_win_amt), s.avg_win_amt == null ? '' : 'pos'),
+    jrCard('Avg loss', s.avg_loss_amt == null ? '—' : jrMoney(s.avg_loss_amt), s.avg_loss_amt == null ? '' : 'neg'),
+    jrCard('Avg hold', s.avg_hold_days == null ? '—' : `${s.avg_hold_days}d`, ''),
   ].join('');
 
   const monthRows = monthly.slice().reverse().map(m => `
@@ -2915,12 +3020,14 @@ async function renderJournal() {
   const tradeRows = pos.map(p => {
     const hold = (p.opened_at && p.closed_at) ? Math.max(0, Math.round((p.closed_at - p.opened_at) / 86400)) : null;
     const d = p.closed_at ? new Date(p.closed_at * 1000).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: '2-digit' }) : '—';
+    // R only means something when the trade carries a real stop (entry > stop).
+    const hasR = p.stop != null && (p.entry - p.stop) > 1e-9;
     return `<div class="jr-trow">
       <span class="jr-sym">${esc(p.symbol)}</span>
       <span class="right muted">₹${(p.entry || 0).toLocaleString('en-IN')} → ₹${(p.exit || 0).toLocaleString('en-IN')}</span>
       <span class="right muted">${p.qty}</span>
       <span class="right ${cl(p.pnl)}">${jrMoney(p.pnl)}</span>
-      <span class="right ${cl(p.r_multiple)}">${(p.r_multiple || 0).toFixed(2)}R</span>
+      <span class="right ${hasR ? cl(p.r_multiple) : 'muted'}">${hasR ? (p.r_multiple || 0).toFixed(2) + 'R' : '—'}</span>
       <span class="right muted">${hold != null ? hold + 'd' : '—'}</span>
       <span class="right muted">${d}</span>
       <span class="right"><button class="jr-del" data-id="${p.id}" title="Delete this trade">×</button></span>
@@ -2952,6 +3059,8 @@ async function renderJournal() {
       </section>
     </div>
   `;
+
+  attachEquityHover(body);
 
   $('jrClearAll')?.addEventListener('click', async () => {
     if (!(await confirmDialog(`This permanently deletes all ${pos.length} closed trade${pos.length === 1 ? '' : 's'}. This can't be undone.`, { title: 'Clear journal?', confirmLabel: 'Clear journal', danger: true }))) return;

@@ -266,10 +266,17 @@
       <h1 class="page-title">Journal</h1>
       <p class="page-sub">Performance across every closed trade — win rate, expectancy, streaks, drawdown and more.</p>
     </div>
-    <button class="btn-kite btn-kite--sync hidden" id="pullJournalBtn" title="Import today's executed trades from Kite as round-trip journal entries. Read-only — no orders are placed.">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 12 5 5 5-5"/><path d="M5 21h14"/></svg>
-      <span class="btn-label">Pull today's trades</span>
-    </button>
+    <span class="journal-actions">
+      <button class="btn-kite btn-kite--sync hidden" id="pullJournalBtn" title="Import today's executed trades from Kite as round-trip journal entries. Read-only — no orders are placed.">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 12 5 5 5-5"/><path d="M5 21h14"/></svg>
+        <span class="btn-label">Pull today's trades</span>
+      </button>
+      <input type="file" id="consoleFileInput" accept=".xlsx,.xls,.csv" hidden>
+      <button class="btn-kite btn-kite--connect" id="importConsoleBtn" title="Import realised P&amp;L from a Kite Console P&amp;L export (Console → Reports → P&amp;L → Download). Uses Kite's exact realised figures.">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3v4a1 1 0 0 0 1 1h4"/><path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2Z"/><path d="M12 17v-6"/><path d="m9.5 13.5 2.5 2.5 2.5-2.5"/></svg>
+        <span class="btn-label">Import Console P&amp;L</span>
+      </button>
+    </span>
   </section>
   <div id="journalBody"></div>
 </div>

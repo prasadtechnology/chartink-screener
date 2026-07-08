@@ -560,6 +560,56 @@ def add_closed_trade(user_id, t):
         return 'added'
 
 
+def import_console_trades(user_id, trades, start_ts, end_ts):
+    """Upsert authoritative realised trades from a Kite Console P&L export.
+
+    Console figures are the source of truth, so for each imported symbol we first
+    remove app-generated rows (LTP-guessed sync closes with a NULL external_id,
+    and same-window live-pull rows 'kite:%') that fall inside the report window —
+    they're superseded to avoid double counting. The window-bounded delete
+    protects trades outside the report's date range. `opened_at` is carried over
+    from a superseded row when the export doesn't carry it. Re-importing the same
+    window updates in place (dedup by external_id). Returns counts.
+    """
+    added = updated = replaced = 0
+    with get_conn() as conn:
+        for t in trades:
+            sym, ext = t['symbol'], t['external_id']
+            prev = conn.execute(
+                "SELECT id, opened_at FROM closed_positions "
+                "WHERE user_id = ? AND symbol = ? "
+                "AND (external_id IS NULL OR external_id LIKE 'kite:%') "
+                "AND (closed_at IS NULL OR (closed_at >= ? AND closed_at <= ?)) "
+                "ORDER BY opened_at IS NULL, opened_at LIMIT 1",
+                (user_id, sym, start_ts, end_ts)).fetchone()
+            carried_opened = t.get('opened_at') or (prev['opened_at'] if prev else None)
+            cur = conn.execute(
+                "DELETE FROM closed_positions WHERE user_id = ? AND symbol = ? "
+                "AND (external_id IS NULL OR external_id LIKE 'kite:%') "
+                "AND (closed_at IS NULL OR (closed_at >= ? AND closed_at <= ?))",
+                (user_id, sym, start_ts, end_ts))
+            replaced += cur.rowcount
+            existing = conn.execute(
+                "SELECT id FROM closed_positions WHERE user_id = ? AND external_id = ?",
+                (user_id, ext)).fetchone()
+            vals = (t['entry'], t['exit'], t['stop'], t['qty'], t['pnl'],
+                    t['r_multiple'], carried_opened, t['closed_at'], t.get('notes'))
+            if existing:
+                conn.execute(
+                    "UPDATE closed_positions SET entry=?, exit=?, stop=?, qty=?, "
+                    "pnl=?, r_multiple=?, opened_at=?, closed_at=?, notes=? WHERE id=?",
+                    (*vals, existing['id']))
+                updated += 1
+            else:
+                conn.execute(
+                    "INSERT INTO closed_positions (user_id, symbol, exchange, entry, "
+                    "exit, stop, qty, pnl, r_multiple, opened_at, closed_at, notes, external_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (user_id, sym, t.get('exchange', 'NSE'), *vals, ext))
+                added += 1
+    return {'added': added, 'updated': updated, 'replaced': replaced}
+
+
 def list_closed_positions(user_id, limit=200):
     with get_conn() as conn:
         rows = conn.execute(

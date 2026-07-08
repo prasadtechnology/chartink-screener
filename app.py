@@ -31,6 +31,7 @@ from sector_data import SECTOR_CONSTITUENTS
 from sector_rs import NIFTY_TICKER, compute_sector_rankings, fetch_close_series
 from vcp_screener import (compute_moving_averages, fetch_ohlc,
                           score_and_analyse)
+import console_pnl
 import db
 import kite_data
 import kite_mcp
@@ -460,9 +461,15 @@ def run_portfolio_sync(uid, kite_items, gtt, sells, last_price_fn):
     """Upsert Kite-sourced holdings and close any that have vanished from Kite.
 
     Shared by both sync routes (Kite Connect and Kite MCP). A holding is matched
-    by (symbol, exchange); its stop is taken from a SELL GTT when present. A
-    previously-synced holding no longer in Kite is treated as sold and moved to
-    the journal using the realised fill (`sells`), else the last price, else entry.
+    by (symbol, exchange); its stop is taken from a SELL GTT when present.
+
+    A previously-synced holding that's gone from Kite is journaled as closed
+    ONLY when we have the *actual* realised sell fill for it (`sells`, today's
+    tradebook). We deliberately do NOT fall back to the last traded price:
+    Kite's API can't return the real fill for a prior-day exit, and an LTP guess
+    drifts as the stock moves after the sale, writing a wrong P&L into the
+    journal. Vanished holdings without a known fill are left in place for the
+    Kite Console P&L import (the source of truth) to reconcile.
     """
     incoming = set()
     added = updated = 0
@@ -475,15 +482,19 @@ def run_portfolio_sync(uid, kite_items, gtt, sells, last_price_fn):
         updated += res['action'] == 'updated'
 
     closed = []
+    pending = 0
     for h in db.list_holdings(uid):
         if h.get('source') != 'kite' or f"{h['exchange']}:{h['symbol']}" in incoming:
             continue
-        key = f"{h['exchange']}:{h['symbol']}"
-        exit_price = sells.get(key) or last_price_fn(h['exchange'], h['symbol']) or h['entry']
-        r = db.close_holding(uid, h['id'], float(exit_price))
+        fill = sells.get(f"{h['exchange']}:{h['symbol']}")
+        if fill is None:
+            pending += 1               # sold, but real price unknown — await Console import
+            continue
+        r = db.close_holding(uid, h['id'], float(fill))
         if r:
-            closed.append({'symbol': h['symbol'], 'exit': round(float(exit_price), 2), **r})
-    return {'added': added, 'updated': updated, 'closed': closed, 'synced': len(kite_items)}
+            closed.append({'symbol': h['symbol'], 'exit': round(float(fill), 2), **r})
+    return {'added': added, 'updated': updated, 'closed': closed,
+            'pending_exit': pending, 'synced': len(kite_items)}
 
 
 @app.route('/api/holdings/sync_kite', methods=['POST'])
@@ -547,25 +558,17 @@ def kite_mcp_sync():
     return jsonify({'ok': True, **res})
 
 
-# --- Pull journal from Kite: today's fills -> round-trip closed trades ---------
-def _holding_lookup(uid):
-    """Return a fn (exchange, symbol) -> holding row, for entry/stop fallback.
+# --- Pull journal from Kite: today's fills -> intraday round-trip trades --------
+def build_round_trips(trades):
+    """Turn today's Kite fills into completed **intraday** round-trip trades.
 
-    A SELL of a delivery position opened before today has no BUY leg in today's
-    tradebook; we price its entry from the app's tracked holding instead.
-    """
-    idx = {f"{h['exchange']}:{h['symbol']}": h for h in db.list_holdings(uid)}
-    return lambda exchange, symbol: idx.get(f"{exchange}:{symbol}")
-
-
-def build_round_trips(trades, holding_lookup):
-    """Turn today's Kite fills into completed round-trip trades (one per SELL).
-
-    Per symbol, FIFO-matches each SELL against earlier BUY fills the same day.
-    Any excess sell quantity (a position opened before today) falls back to the
-    app's tracked holding entry/stop so the exit still journals with a real R.
-    A SELL with nothing to match against (e.g. a short) is skipped. Returns a
-    list of closed-trade dicts ready for db.add_closed_trade.
+    Per symbol, FIFO-matches each SELL against earlier same-day BUY fills and
+    journals only the quantity covered by those buys — i.e. positions both
+    opened and closed today. Any sell quantity NOT covered by a same-day buy is
+    a *delivery* exit (the position was held from a prior day); that is left to
+    the Holdings sync, which closes it with the real fill plus the stored
+    entry/stop. Keeping the two paths disjoint means a same-day delivery sale is
+    never journaled twice. Intraday trades carry no stop, so R = 0.
     """
     from collections import defaultdict, deque
     by_key = defaultdict(list)
@@ -577,17 +580,11 @@ def build_round_trips(trades, holding_lookup):
         exch, sym = key.split(':', 1)
         fills.sort(key=lambda x: x['ts'])
         buys = deque()                      # FIFO lots: [qty, price, ts]
-        h = holding_lookup(exch, sym)
-        fb_qty = float(h['qty']) if h else 0.0
-        fb_entry = float(h['entry']) if h else None
-        fb_stop = float(h['stop']) if h else None
-        fb_opened = h.get('opened_at') if h else None
-
         for t in fills:
             if t['type'] == 'BUY':
                 buys.append([t['qty'], t['price'], t['ts']])
                 continue
-            # SELL -> assemble one round trip
+            # SELL -> match against today's buys only (intraday portion)
             remaining = t['qty']
             cost = matched = 0.0
             opened_at = None
@@ -602,39 +599,26 @@ def build_round_trips(trades, holding_lookup):
                 remaining -= take
                 if lot[0] <= 1e-9:
                     buys.popleft()
-            used_fallback = False
-            if remaining > 1e-9 and fb_entry is not None and fb_qty > 1e-9:
-                take = min(remaining, fb_qty)
-                cost += take * fb_entry
-                matched += take
-                fb_qty -= take
-                remaining -= take
-                used_fallback = True
-                if opened_at is None:
-                    opened_at = fb_opened
             if matched <= 1e-9:
-                continue                    # unmatched sell (short / unknown) -> skip
+                continue                    # no same-day buy -> delivery exit (sync owns it)
             entry = cost / matched
-            stop = fb_stop if (used_fallback and fb_stop is not None) else entry
-            risk = entry - stop
             exit_p = t['price']
             pnl = (exit_p - entry) * matched
-            r_mult = (exit_p - entry) / risk if risk > 0 else 0
             out.append({
                 'symbol': sym, 'exchange': exch,
                 'entry': round(entry, 2), 'exit': round(exit_p, 2),
-                'stop': round(stop, 2), 'qty': int(round(matched)),
-                'pnl': round(pnl, 2), 'r_multiple': round(r_mult, 2),
+                'stop': round(entry, 2), 'qty': int(round(matched)),
+                'pnl': round(pnl, 2), 'r_multiple': 0.0,
                 'opened_at': opened_at or t['ts'], 'closed_at': t['ts'],
-                'notes': 'Imported from Kite',
+                'notes': 'Imported from Kite (intraday)',
                 'external_id': f"kite:{t['trade_id']}" if t.get('trade_id') else None,
             })
     return out
 
 
 def run_journal_import(uid, trades):
-    """Build round trips from today's fills and upsert them into the journal."""
-    trips = build_round_trips(trades, _holding_lookup(uid))
+    """Build intraday round trips from today's fills and upsert them."""
+    trips = build_round_trips(trades)
     added = skipped = 0
     imported = []
     for t in trips:
@@ -673,6 +657,65 @@ def kite_mcp_journal():
     return jsonify({'ok': True, **run_journal_import(current_user_id(), trades)})
 
 
+@app.route('/api/journal/import_console', methods=['POST'])
+@login_required
+def journal_import_console():
+    """Import realised trades from an uploaded Kite Console P&L export (xlsx/csv).
+
+    Console carries the broker's own realised P&L, so these figures are
+    authoritative and supersede any LTP-guessed or live-pull rows for the same
+    symbols within the report's date range (see db.import_console_trades).
+    """
+    f = request.files.get('file')
+    if not f or not f.filename:
+        return jsonify({'error': 'no_file'}), 400
+    try:
+        parsed = console_pnl.parse(f.read(), f.filename)
+    except ImportError:
+        # The .xlsx reader (openpyxl) isn't installed in the running app.
+        app.logger.exception('console import: openpyxl missing')
+        return jsonify({'error': 'xlsx_support_missing'}), 422
+    except ValueError as e:
+        return jsonify({'error': 'parse_failed', 'detail': str(e)}), 422
+    except Exception as e:
+        app.logger.exception('console import: parse failed')
+        return jsonify({'error': 'parse_failed', 'detail': str(e)}), 422
+
+    trades = parsed['trades']
+    if not trades:
+        return jsonify({'ok': True, 'added': 0, 'updated': 0, 'replaced': 0,
+                        'realized': 0, 'held': parsed.get('held', []),
+                        'message': 'no_realized_trades'})
+
+    # Console reports carry no stop, so R-multiple isn't meaningful for imports:
+    # stop = entry gives R = 0 rather than a fabricated risk figure.
+    # Supersede window spans whole calendar days: a superseded sync-close may be
+    # stamped any time on the report's end date, so bound to 00:00 → 23:59:59.
+    import datetime as _d
+    def _ts(iso, end=False):
+        try:
+            d = _d.date.fromisoformat(iso)
+            t = _d.time(23, 59, 59) if end else _d.time(0, 0, 0)
+            return int(_d.datetime.combine(d, t).timestamp())
+        except Exception:
+            return None
+    start_ts = _ts(parsed.get('start')) or 0
+    end_ts = _ts(parsed.get('end'), end=True) or int(time.time())
+    prepared = [{
+        'symbol': t['symbol'], 'exchange': 'NSE',
+        'entry': t['entry'], 'exit': t['exit'], 'stop': t['entry'],
+        'qty': t['qty'], 'pnl': t['pnl'], 'r_multiple': 0.0,
+        'opened_at': None, 'closed_at': t['closed_at'],
+        'notes': 'Imported from Kite Console',
+        'external_id': f"console:{t['symbol']}:{parsed.get('end') or ''}",
+    } for t in trades]
+    res = db.import_console_trades(current_user_id(), prepared, start_ts, end_ts)
+    return jsonify({'ok': True, 'realized': parsed['realized_summary'],
+                    'range': [parsed.get('start'), parsed.get('end')],
+                    'symbols': [t['symbol'] for t in trades],
+                    'held': parsed.get('held', []), **res})
+
+
 def compute_journal_stats(rows):
     """Rich trading-journal metrics from closed positions.
 
@@ -691,11 +734,27 @@ def compute_journal_stats(rows):
     gross_loss = -sum(r['pnl'] for r in losses)          # positive magnitude
     total_pnl = sum(r['pnl'] for r in chrono)
     win_rate = len(wins) / n * 100
-    avg_win_r = sum(r['r_multiple'] for r in wins) / len(wins) if wins else 0
-    avg_loss_r = sum(r['r_multiple'] for r in losses) / len(losses) if losses else 0
-    avg_rr = sum(r['r_multiple'] for r in chrono) / n
-    expectancy = (len(wins) / n) * avg_win_r + (len(losses) / n) * avg_loss_r
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (gross_profit if gross_profit else 0)
+
+    # R-multiple metrics are only meaningful for trades that carry a real stop
+    # (risk = entry - stop > 0). Console-imported trades have no stop, so they're
+    # excluded here and these stats read as "no data" (None -> "—") rather than a
+    # misleading 0R. Trades with stops (manual/synced) still contribute normally.
+    r_rows = [r for r in chrono
+              if r.get('stop') is not None and (r['entry'] - r['stop']) > 1e-9]
+    r_wins = [r for r in r_rows if r['pnl'] > 0]
+    r_losses = [r for r in r_rows if r['pnl'] < 0]
+
+    def _avg(vals):
+        return (sum(vals) / len(vals)) if vals else None
+    avg_win_r = _avg([r['r_multiple'] for r in r_wins])
+    avg_loss_r = _avg([r['r_multiple'] for r in r_losses])
+    avg_rr = _avg([r['r_multiple'] for r in r_rows])
+    if r_rows:
+        nr = len(r_rows)
+        expectancy = (len(r_wins) / nr) * (avg_win_r or 0) + (len(r_losses) / nr) * (avg_loss_r or 0)
+    else:
+        expectancy = None
 
     # Max consecutive win / loss streaks (chronological)
     max_win_streak = max_loss_streak = cur_w = cur_l = 0
@@ -730,9 +789,11 @@ def compute_journal_stats(rows):
         max_dd = max(max_dd, peak - cum)
         equity.append({'pnl': round(cum, 2), 't': r.get('closed_at'), 'symbol': r.get('symbol')})
 
+    # Hold time needs an entry date; Console imports don't carry one, so avg is
+    # over trades that have opened_at, and None ("—") when none do.
     holds = [(r['closed_at'] - r['opened_at']) / 86400
              for r in chrono if r.get('opened_at') and r.get('closed_at')]
-    avg_hold_days = sum(holds) / len(holds) if holds else 0
+    avg_hold_days = (sum(holds) / len(holds)) if holds else None
 
     # Monthly breakdown
     months = {}
@@ -751,22 +812,28 @@ def compute_journal_stats(rows):
         'pnl': round(m['pnl'], 2),
     } for m in months.values()]
 
+    def _rnd(v, d=2):
+        return None if v is None else round(v, d)
     stats = {
         'total_trades': n, 'wins': len(wins), 'losses': len(losses),
         'win_rate': round(win_rate, 1), 'loss_rate': round(len(losses) / n * 100, 1),
         'total_pnl': round(total_pnl, 2),
         'gross_profit': round(gross_profit, 2), 'gross_loss': round(gross_loss, 2),
         'profit_factor': round(profit_factor, 2),
-        'avg_win_r': round(avg_win_r, 2), 'avg_loss_r': round(avg_loss_r, 2),
-        'avg_rr': round(avg_rr, 2), 'expectancy_r': round(expectancy, 2),
+        'avg_win_r': _rnd(avg_win_r), 'avg_loss_r': _rnd(avg_loss_r),
+        # Rupee averages — always computable (no stop needed), unlike the R ones.
+        'avg_win_amt': _rnd((gross_profit / len(wins)) if wins else None),
+        'avg_loss_amt': _rnd((-gross_loss / len(losses)) if losses else None),
+        'avg_rr': _rnd(avg_rr), 'expectancy_r': _rnd(expectancy),
         'largest_win': round(max((r['pnl'] for r in chrono), default=0), 2),
         'largest_loss': round(min((r['pnl'] for r in chrono), default=0), 2),
-        'best_r': round(max((r['r_multiple'] for r in chrono), default=0), 2),
-        'worst_r': round(min((r['r_multiple'] for r in chrono), default=0), 2),
+        'best_r': _rnd(max((r['r_multiple'] for r in r_rows), default=None)),
+        'worst_r': _rnd(min((r['r_multiple'] for r in r_rows), default=None)),
+        'r_basis_trades': len(r_rows),
         'max_win_streak': max_win_streak, 'max_loss_streak': max_loss_streak,
         'current_streak': current_streak,
         'max_drawdown': round(max_dd, 2),
-        'avg_hold_days': round(avg_hold_days, 1),
+        'avg_hold_days': _rnd(avg_hold_days, 1),
     }
     return {'stats': stats, 'monthly': monthly, 'equity': equity}
 
