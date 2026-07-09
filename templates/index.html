@@ -32,6 +32,7 @@
     <button class="nav-tab" data-view="sectors">Sectors</button>
     <button class="nav-tab" data-view="holdings">Holdings <span class="nav-count" id="navHoldingsCount">0</span></button>
     <button class="nav-tab" data-view="journal">Journal</button>
+    <button class="nav-tab" data-view="breadth">Breadth</button>
   </nav>
   <div class="header-meta">
     <span class="status-dot" id="statusDot"></span>
@@ -279,6 +280,15 @@
     </span>
   </section>
   <div id="journalBody"></div>
+</div>
+
+<!-- ================= BREADTH VIEW ================= -->
+<div class="view hidden" id="breadthView">
+  <section class="page-intro">
+    <h1 class="page-title">Market breadth</h1>
+    <p class="page-sub">Unique stocks your scan surfaces each day — a rising count means broadening participation, a falling one means the market is narrowing.</p>
+  </section>
+  <div id="breadthBody"></div>
 </div>
 
 </main>

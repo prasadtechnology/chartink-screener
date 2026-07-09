@@ -1403,6 +1403,26 @@ body { position: relative; overflow-x: hidden; }
   border-radius: 999px;
   vertical-align: middle;
 }
+/* Long-term hold chip (intentional no-stop) */
+.lt-badge {
+  display: inline-block;
+  padding: 0.05rem 0.4rem;
+  font-size: 0.6rem; font-weight: 700; letter-spacing: 0.03em; text-transform: uppercase;
+  color: var(--pos); background: var(--pos-dim);
+  border: 1px solid color-mix(in srgb, var(--pos) 30%, transparent);
+  border-radius: 999px; vertical-align: middle;
+}
+/* Toggle: mark / unmark a holding as long-term */
+.ht-lt-btn {
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  color: var(--text-dim);
+  font-family: var(--font-sans); font-size: 0.68rem; font-weight: 500;
+  padding: 0.24rem 0.55rem; border-radius: 999px; cursor: pointer;
+  white-space: nowrap; transition: all 0.14s;
+}
+.ht-lt-btn:hover { color: var(--text); border-color: var(--text-faint); background: var(--bg-muted); }
+.ht-lt-btn:disabled { opacity: 0.5; cursor: default; }
 .ht-pos { color: var(--pos); font-weight: 500; }
 .ht-neg { color: var(--neg); font-weight: 500; }
 .ht-stop-hit {
@@ -3260,6 +3280,20 @@ body.theme-dark .toast { box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5); }
 .jr-section .section-head .btn-link-danger:hover { color: var(--neg); border-color: var(--neg); background: var(--neg-dim); }
 .jr-del { background: transparent; border: none; color: var(--text-faint); cursor: pointer; font-size: 0.95rem; line-height: 1; padding: 0 0.25rem; border-radius: 4px; }
 .jr-del:hover { color: var(--neg); background: var(--neg-dim); }
+
+/* ---- Market breadth history table ---- */
+.br-thead, .br-trow {
+  display: grid; grid-template-columns: 1.4fr 0.8fr 0.6fr 0.9fr;
+  gap: 0.5rem; align-items: center; padding: 0.5rem 0.85rem;
+}
+.br-thead { background: var(--bg-muted); color: var(--text-faint); font-family: var(--font-mono); font-size: 0.64rem; text-transform: uppercase; letter-spacing: 0.05em; }
+.br-trow { border-top: 1px solid var(--border); font-family: var(--font-mono); font-size: 0.78rem; }
+.br-trow:nth-of-type(even) { background: var(--bg-elev); }
+.br-thead .right, .br-trow .right { text-align: right; }
+.br-trow .muted { color: var(--text-dim); }
+.br-trow .pos { color: var(--pos); font-weight: 600; }
+.br-trow .neg { color: var(--neg); font-weight: 600; }
+.br-single { padding: 2.5rem 1rem; text-align: center; color: var(--text-dim); font-family: var(--font-mono); font-size: 0.85rem; }
 
 /* ============================================================
    GEMINI-STYLE SOFTNESS — rounder surfaces, pill controls, airy

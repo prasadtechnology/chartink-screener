@@ -64,6 +64,7 @@ def init_db():
                 opened_at INTEGER NOT NULL,
                 notes TEXT,
                 source TEXT NOT NULL DEFAULT 'manual',
+                long_term INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_holdings_user ON holdings(user_id);
@@ -138,6 +139,17 @@ def init_db():
                 PRIMARY KEY (symbol, exchange, interval)
             );
             CREATE INDEX IF NOT EXISTS idx_cache_date ON chart_cache(cached_date);
+
+            CREATE TABLE IF NOT EXISTS scan_breadth (
+                user_id INTEGER NOT NULL,
+                scan_date TEXT NOT NULL,
+                unique_count INTEGER NOT NULL,
+                files INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (user_id, scan_date),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_breadth_user ON scan_breadth(user_id);
         ''')
 
         # Migration for older databases
@@ -148,6 +160,9 @@ def init_db():
         # Provenance of a holding: 'manual' or 'kite' (added for Kite portfolio sync).
         if _table_exists(conn, 'holdings') and not _column_exists(conn, 'holdings', 'source'):
             conn.execute("ALTER TABLE holdings ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")
+        # Long-term hold flag: no stop expected, excluded from open-risk & R math.
+        if _table_exists(conn, 'holdings') and not _column_exists(conn, 'holdings', 'long_term'):
+            conn.execute("ALTER TABLE holdings ADD COLUMN long_term INTEGER NOT NULL DEFAULT 0")
         # Dedup key for trades imported from Kite ("Pull journal from Kite").
         # Add the column first (older DBs lack it), then build the unique index —
         # doing it here (not in the CREATE block above) guarantees the column
@@ -445,6 +460,16 @@ def delete_holding(user_id, id_):
         return cur.rowcount > 0
 
 
+def set_holding_long_term(user_id, id_, flag):
+    """Mark/unmark a holding as a long-term hold (no stop, excluded from risk)."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            'UPDATE holdings SET long_term = ? WHERE id = ? AND user_id = ?',
+            (1 if flag else 0, id_, user_id)
+        )
+        return cur.rowcount > 0
+
+
 def close_holding(user_id, id_, exit_price, notes=None):
     with get_conn() as conn:
         h = conn.execute(
@@ -633,6 +658,38 @@ def clear_closed_positions(user_id):
             'DELETE FROM closed_positions WHERE user_id = ?', (user_id,)
         )
         return cur.rowcount
+
+
+# ---------------- Scan breadth (market-breadth trend) ----------------
+def record_scan_breadth(user_id, unique_count, files=0):
+    """Upsert today's scan size (unique symbols) for the user — one point per day.
+
+    Re-scanning the same day overwrites, so the trend is a clean daily series of
+    "how many stocks the screen surfaced". Uses IST calendar date to match the
+    chart cache's day boundary.
+    """
+    date = trading_date_today()
+    with get_conn() as conn:
+        conn.execute(
+            'INSERT INTO scan_breadth (user_id, scan_date, unique_count, files, updated_at) '
+            'VALUES (?, ?, ?, ?, ?) '
+            'ON CONFLICT(user_id, scan_date) DO UPDATE SET '
+            'unique_count = excluded.unique_count, files = excluded.files, '
+            'updated_at = excluded.updated_at',
+            (user_id, date, int(unique_count), int(files), int(time.time()))
+        )
+    return {'date': date, 'unique_count': int(unique_count)}
+
+
+def list_scan_breadth(user_id, limit=365):
+    """Chronological breadth history (oldest -> newest) for the user."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            'SELECT scan_date, unique_count, files, updated_at FROM scan_breadth '
+            'WHERE user_id = ? ORDER BY scan_date ASC LIMIT ?',
+            (user_id, limit)
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 if __name__ == '__main__':

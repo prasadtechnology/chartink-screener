@@ -3086,6 +3086,134 @@ async function renderJournal() {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Market breadth — unique stocks scanned per day, as a trend
+// ---------------------------------------------------------------------------
+function breadthChart(hist, colors) {
+  const n = hist.length;
+  if (n < 2) {
+    const one = hist[0];
+    return `<div class="br-single">One scan so far — <b>${one.unique_count}</b> stock${one.unique_count === 1 ? '' : 's'} on ${one.scan_date}. The trend line appears from the second day.</div>`;
+  }
+  const w = 900, h = 200, pad = 10;
+  const vals = hist.map(x => x.unique_count);
+  const min = Math.min(...vals), max = Math.max(...vals);
+  const padV = Math.max(1, Math.round((max - min) * 0.15));
+  const lo = Math.max(0, min - padV), hi = max + padV, range = (hi - lo) || 1;
+  const X = i => pad + (i / (n - 1)) * (w - 2 * pad);
+  const Y = v => pad + (1 - (v - lo) / range) * (h - 2 * pad);
+  const pts = hist.map((e, i) => `${X(i).toFixed(1)},${Y(e.unique_count).toFixed(1)}`).join(' ');
+  const area = `M${X(0).toFixed(1)},${Y(lo).toFixed(1)} L` + hist.map((e, i) => `${X(i).toFixed(1)},${Y(e.unique_count).toFixed(1)}`).join(' L') + ` L${X(n - 1).toFixed(1)},${Y(lo).toFixed(1)} Z`;
+  const col = colors.accent;
+  let len = 0; for (let i = 1; i < n; i++) len += Math.hypot(X(i) - X(i - 1), Y(vals[i]) - Y(vals[i - 1]));
+  const dotX = X(n - 1).toFixed(1), dotY = Y(vals[n - 1]).toFixed(1);
+  const fmtD = s => { const d = new Date(s + 'T00:00:00'); return isNaN(d) ? s : d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' }); };
+  const yLbl = (v, txt) => `<span class="jr-eq-yl" style="top:${Y(v).toFixed(1)}px">${txt}</span>`;
+  const pd = hist.map((e, i) => ({ x: +(X(i) / w * 100).toFixed(2), y: +Y(e.unique_count).toFixed(1), c: e.unique_count, d: fmtD(e.scan_date) }));
+  return `<div class="jr-eq-wrap" data-trend='${JSON.stringify(pd).replace(/'/g, '&#39;')}'>
+    <svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" class="jr-eq-svg draw" style="--eq-len:${Math.ceil(len)}" role="img" aria-label="Market breadth trend — unique stocks scanned per day">
+      <defs><linearGradient id="brgrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${col}" stop-opacity="0.26"/><stop offset="1" stop-color="${col}" stop-opacity="0"/></linearGradient></defs>
+      <path d="${area}" fill="url(#brgrad)"/>
+      <polyline points="${pts}" fill="none" stroke="${col}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+      <circle class="jr-eq-dot" cx="${dotX}" cy="${dotY}" r="3.2" fill="${col}"/>
+    </svg>
+    ${yLbl(max, String(max))}
+    ${min !== max ? yLbl(min, String(min)) : ''}
+    <span class="jr-eq-cur" style="top:${dotY}px;color:#fff;background:${col}">${vals[n - 1]}</span>
+    <span class="jr-eq-xl" style="left:0">${fmtD(hist[0].scan_date)}</span>
+    <span class="jr-eq-xl" style="right:0">${fmtD(hist[n - 1].scan_date)}</span>
+    <div class="jr-eq-marker hidden"></div>
+    <div class="jr-eq-tip hidden"></div>
+  </div>`;
+}
+
+function attachTrendHover(root) {
+  const wrap = root.querySelector('.jr-eq-wrap[data-trend]');
+  if (!wrap) return;
+  let pts;
+  try { pts = JSON.parse(wrap.dataset.trend); } catch { return; }
+  if (!pts || !pts.length) return;
+  const marker = wrap.querySelector('.jr-eq-marker'), tip = wrap.querySelector('.jr-eq-tip');
+  wrap.addEventListener('mousemove', (e) => {
+    const r = wrap.getBoundingClientRect();
+    const xPct = ((e.clientX - r.left) / r.width) * 100;
+    let best = pts[0], bd = Infinity;
+    for (const p of pts) { const d = Math.abs(p.x - xPct); if (d < bd) { bd = d; best = p; } }
+    marker.style.left = best.x + '%'; marker.style.top = best.y + 'px'; marker.classList.remove('hidden');
+    tip.innerHTML = `<b>${best.c}</b> stocks <span>${best.d}</span>`;
+    tip.style.left = Math.min(Math.max(best.x, 12), 88) + '%';
+    tip.style.top = Math.max(best.y - 14, 4) + 'px'; tip.classList.remove('hidden');
+  });
+  wrap.addEventListener('mouseleave', () => { marker.classList.add('hidden'); tip.classList.add('hidden'); });
+}
+
+async function renderBreadth() {
+  const body = $('breadthBody');
+  body.innerHTML = loaderHTML('Loading breadth history…');
+  let hist;
+  try { hist = (await (await fetch('/api/scan_breadth')).json()).history || []; }
+  catch (e) { body.innerHTML = `<p class="empty-tab">Failed to load: ${esc(e.message)}</p>`; return; }
+
+  if (!hist.length) {
+    body.innerHTML = `<div class="empty-state">
+      <p>No scans recorded yet. Drop a Chartink CSV on the <b>Scan</b> tab — each day's unique-stock count is logged here, and the trend builds up over time.</p>
+      <button class="btn-primary" id="brGoScan" style="margin-top:1rem">Go to Scan →</button>
+    </div>`;
+    $('brGoScan')?.addEventListener('click', () => document.querySelector('[data-view="scan"]')?.click());
+    return;
+  }
+
+  const counts = hist.map(h => h.unique_count);
+  const latest = counts[counts.length - 1];
+  const prev = counts.length > 1 ? counts[counts.length - 2] : null;
+  const change = prev == null ? null : latest - prev;
+  const avg = Math.round(counts.reduce((a, b) => a + b, 0) / counts.length);
+  const peak = Math.max(...counts), low = Math.min(...counts);
+
+  const cs = getComputedStyle(document.body);
+  const colors = {
+    accent: cs.getPropertyValue('--accent').trim() || '#2563eb',
+    pos: cs.getPropertyValue('--pos').trim() || '#34d399',
+    neg: cs.getPropertyValue('--neg').trim() || '#fb7185',
+  };
+  const chgTxt = change == null ? '—' : `${change > 0 ? '▲ +' : (change < 0 ? '▼ −' : '±')}${Math.abs(change)}`;
+  const chgCls = change == null ? '' : (change > 0 ? 'pos' : (change < 0 ? 'neg' : ''));
+
+  const cards = [
+    jrCard('Latest scan', `${latest} <i>stocks</i>`, ''),
+    jrCard('vs previous', chgTxt, chgCls),
+    jrCard('Average', `${avg}`, ''),
+    jrCard('Peak', `${peak}`, 'pos'),
+    jrCard('Low', `${low}`, 'neg'),
+    jrCard('Days tracked', `${hist.length}`, ''),
+  ].join('');
+
+  const rows = hist.slice().reverse().map((h, i) => {
+    const idx = hist.length - 1 - i;
+    const p = idx > 0 ? hist[idx - 1].unique_count : null;
+    const d = p == null ? null : h.unique_count - p;
+    const dTxt = d == null ? '—' : `${d > 0 ? '+' : ''}${d}`;
+    const dCls = d == null ? 'muted' : (d > 0 ? 'pos' : (d < 0 ? 'neg' : 'muted'));
+    return `<div class="br-trow"><span>${h.scan_date}</span><span class="right">${h.unique_count}</span><span class="right muted">${h.files || '—'}</span><span class="right ${dCls}">${dTxt}</span></div>`;
+  }).join('');
+
+  body.innerHTML = `
+    <div class="jr-cards">${cards}</div>
+    <section class="jr-section">
+      <div class="section-head"><h3 class="label">Breadth trend</h3><span class="jr-sub">unique stocks scanned · ${hist.length} day${hist.length === 1 ? '' : 's'}</span></div>
+      <div class="jr-eq">${breadthChart(hist, colors)}</div>
+    </section>
+    <section class="jr-section">
+      <div class="section-head"><h3 class="label">History</h3><span class="jr-sub">${hist.length}</span></div>
+      <div class="jr-table">
+        <div class="br-thead"><span>Date</span><span class="right">Stocks</span><span class="right">Files</span><span class="right">Δ vs prev</span></div>
+        ${rows}
+      </div>
+    </section>
+  `;
+  attachTrendHover(body);
+}
+
 // Standalone Sectors view (top-nav) — same sector-strength UI, no CSV required.
 function renderSectorsView() {
   const body = $('sectorsBody');
@@ -3138,9 +3266,11 @@ document.querySelectorAll('.nav-tab').forEach(t => {
     $('sectorsView').classList.toggle('hidden', view !== 'sectors');
     $('holdingsView').classList.toggle('hidden', view !== 'holdings');
     $('journalView').classList.toggle('hidden', view !== 'journal');
+    $('breadthView').classList.toggle('hidden', view !== 'breadth');
     if (view === 'holdings') renderHoldings();
     if (view === 'journal') renderJournal();
     if (view === 'sectors') renderSectorsView();
+    if (view === 'breadth') renderBreadth();
     playViewEnter($(view + 'View'));
   });
 });
@@ -3419,9 +3549,20 @@ function renderHoldingsTable(data) {
     const pnlSign = (h.pnl || 0) >= 0 ? '+' : '';
     const rSign = (h.r_multiple || 0) >= 0 ? '+' : '';
     const kiteBadge = h.source === 'kite' ? '<span class="src-badge" title="Synced from Kite">Kite</span>' : '';
-    const slCell = (h.stop >= h.entry)
-      ? '<span class="muted stop-unset" style="margin-left:0.5rem" title="No stop set — open risk & R need a stop. Add a stop-loss GTT in Kite and re-sync.">⚠ set stop</span>'
-      : `<span class="muted" style="margin-left:0.5rem">SL ₹${h.stop.toLocaleString('en-IN')}</span>`;
+    // Long-term hold: no stop by design. Otherwise show the stop / a "set stop" nudge.
+    let slCell, ltBtn;
+    if (h.long_term) {
+      slCell = '<span class="lt-badge" style="margin-left:0.5rem" title="Long-term hold — no stop, excluded from open risk & R">Long-term</span>';
+      ltBtn = `<button class="ht-lt-btn" data-id="${h.id}" data-lt="0" title="Remove long-term (track a stop again)">Track stop</button>`;
+    } else if (h.stop >= h.entry) {
+      slCell = '<span class="muted stop-unset" style="margin-left:0.5rem" title="No stop set — open risk & R need a stop. Add a stop-loss GTT in Kite and re-sync.">⚠ set stop</span>';
+      ltBtn = `<button class="ht-lt-btn" data-id="${h.id}" data-lt="1" title="Mark as a long-term hold (no stop expected)">Long-term</button>`;
+    } else {
+      slCell = `<span class="muted" style="margin-left:0.5rem">SL ₹${h.stop.toLocaleString('en-IN')}</span>`;
+      ltBtn = '';
+    }
+    const riskCell = h.long_term ? '<span class="muted">—</span>' : `₹${Math.round(h.open_risk||0).toLocaleString('en-IN')}`;
+    const rCell = h.long_term ? '<span class="muted">—</span>' : `${rSign}${(h.r_multiple||0).toFixed(2)}R`;
     return `
       <div class="${rowCls}">
         <div>
@@ -3433,9 +3574,10 @@ function renderHoldingsTable(data) {
         <div class="right muted">${h.qty}</div>
         <div class="right ${pnlCls}">${pnlSign}₹${Math.abs(Math.round(h.pnl||0)).toLocaleString('en-IN')}</div>
         <div class="right ${pnlCls}">${pnlSign}${(h.pnl_pct||0).toFixed(2)}%</div>
-        <div class="right ht-neg">₹${Math.round(h.open_risk||0).toLocaleString('en-IN')}</div>
-        <div class="right ${rCls}">${rSign}${(h.r_multiple||0).toFixed(2)}R</div>
+        <div class="right ${h.long_term ? '' : 'ht-neg'}">${riskCell}</div>
+        <div class="right ${h.long_term ? '' : rCls}">${rCell}</div>
         <div class="right ht-actions">
+          ${ltBtn}
           <button class="ht-close" data-id="${h.id}" title="Close position — records it to your journal">Close</button>
           <button class="ht-del" data-id="${h.id}" title="Remove (discard, no journal entry)">×</button>
         </div>
@@ -3463,6 +3605,24 @@ function renderHoldingsTable(data) {
       if (!(await confirmDialog('This removes it from your open positions. Closed-trade history is unaffected.', { title: 'Remove this position?', confirmLabel: 'Remove', danger: true }))) return;
       await deleteHoldingById(id);
       await renderHoldings();
+    });
+  });
+
+  document.querySelectorAll('.ht-lt-btn').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      const el = e.currentTarget;
+      const id = parseInt(el.dataset.id, 10);
+      const flag = el.dataset.lt === '1';
+      el.disabled = true;
+      try {
+        const r = await fetch(`/api/holdings/${id}/long_term`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ long_term: flag }),
+        });
+        if (!r.ok) throw new Error('request failed');
+        showToast(flag ? 'Marked as long-term — excluded from risk & R.' : 'Now tracking a stop again.', 'success');
+        await renderHoldings();
+      } catch (err) { el.disabled = false; showToast('Failed: ' + err.message, 'error'); }
     });
   });
 

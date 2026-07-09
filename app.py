@@ -263,11 +263,24 @@ def parse_uploads():
         all_symbols.update(symbols)
     total_raw = sum(len(p['symbols']) for p in per_file)
     unique = sorted(all_symbols)
+    # Log today's scan size for the market-breadth trend (one point per day).
+    if unique:
+        try:
+            db.record_scan_breadth(current_user_id(), len(unique), len(files))
+        except Exception as e:
+            print(f'[breadth] record failed: {e}')
     return jsonify({
         'total_files': len(files), 'total_raw': total_raw,
         'unique_count': len(unique), 'duplicates_removed': total_raw - len(unique),
         'symbols': unique, 'per_file': per_file,
     })
+
+
+@app.route('/api/scan_breadth', methods=['GET'])
+@login_required
+def scan_breadth():
+    """Market-breadth history: unique-stocks-scanned per day (chronological)."""
+    return jsonify({'history': db.list_scan_breadth(current_user_id())})
 
 
 @app.route('/api/screen_one', methods=['POST'])
@@ -445,6 +458,16 @@ def holdings_close(holding_id):
     if result is None:
         return jsonify({'error': 'Holding not found'}), 404
     return jsonify({'ok': True, **result})
+
+
+@app.route('/api/holdings/<int:holding_id>/long_term', methods=['POST'])
+@login_required
+def holdings_long_term(holding_id):
+    """Mark/unmark a holding as a long-term hold (no stop, excluded from risk)."""
+    flag = bool((request.get_json(silent=True) or {}).get('long_term', True))
+    if not db.set_holding_long_term(current_user_id(), holding_id, flag):
+        return jsonify({'error': 'not_found'}), 404
+    return jsonify({'ok': True, 'long_term': flag})
 
 
 def _merge_kite_portfolio(holdings_list, positions_list, include_positions):
@@ -916,18 +939,24 @@ def holdings_refresh():
         if err is not None or cmp is None:
             out['error'] = err or 'No data'; out['cmp'] = None
         else:
+            is_lt = bool(h.get('long_term'))
             invested = entry * qty
             value = cmp * qty
             pnl = value - invested
             pnl_pct = (cmp / entry - 1) * 100 if entry > 0 else 0
-            initial_risk = (entry - stop) * qty if stop < entry else 0
-            if cmp > stop:
-                open_risk = (cmp - stop) * qty
-                locked_profit = (stop - entry) * qty if stop > entry else 0
+            if is_lt:
+                # Long-term hold: no stop by design -> no risk / R, and it never
+                # contributes to portfolio open risk.
+                initial_risk = open_risk = locked_profit = r_mult = 0
             else:
-                open_risk = 0; locked_profit = pnl
-            rps = entry - stop if entry > stop else 0
-            r_mult = (cmp - entry) / rps if rps > 0 else 0
+                initial_risk = (entry - stop) * qty if stop < entry else 0
+                if cmp > stop:
+                    open_risk = (cmp - stop) * qty
+                    locked_profit = (stop - entry) * qty if stop > entry else 0
+                else:
+                    open_risk = 0; locked_profit = pnl
+                rps = entry - stop if entry > stop else 0
+                r_mult = (cmp - entry) / rps if rps > 0 else 0
             out.update({
                 'cmp': round(cmp, 2),
                 'invested': round(invested, 2), 'value': round(value, 2),
@@ -936,7 +965,8 @@ def holdings_refresh():
                 'open_risk': round(open_risk, 2),
                 'locked_profit': round(locked_profit, 2),
                 'r_multiple': round(r_mult, 2),
-                'stop_hit': cmp <= stop,
+                'stop_hit': (not is_lt) and (cmp <= stop),
+                'long_term': is_lt,
             })
             total_invested += invested; total_value += value
             total_open_risk += open_risk; total_locked_profit += locked_profit
