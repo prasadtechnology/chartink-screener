@@ -987,7 +987,7 @@ const THEMES = [
   { id: 'teal',   label: 'Teal',   dark: false, sw: '#0f9b8e' },
   { id: 'paper',  label: 'Paper',  dark: false, sw: '#b5740f' },
   { id: 'aurora', label: 'Aurora', dark: true,  sw: '#8b93ff' },
-  { id: 'amber',  label: 'Amber',  dark: true,  sw: '#e0a325' },
+  { id: 'nebula', label: 'Nebula', dark: true,  sw: 'linear-gradient(135deg,#8b5cf6,#22d3ee)' },
 ];
 const THEME_IDS = THEMES.map(t => t.id);
 
@@ -995,6 +995,7 @@ function getTheme() {
   let v = localStorage.getItem(THEME_KEY);
   if (v === 'light') v = 'gemini';     // migrate the old binary values
   if (v === 'dark') v = 'aurora';
+  if (v === 'amber') v = 'nebula';     // amber retired -> its slot is Nebula
   return THEME_IDS.includes(v) ? v : 'gemini';
 }
 function _themeMeta(id) { return THEMES.find(t => t.id === id) || THEMES[0]; }
@@ -2858,7 +2859,51 @@ $('pullJournalBtn')?.addEventListener('click', pullKiteJournal);
 $('importConsoleBtn')?.addEventListener('click', () => $('consoleFileInput')?.click());
 $('consoleFileInput')?.addEventListener('change', (e) => importConsolePnl(e.target.files?.[0]));
 
+// ---------------------------------------------------------------------------
+// Chart data source toggle: yfinance <-> Kite (browser-login MCP or API key)
+// ---------------------------------------------------------------------------
+function paintSource(state) {
+  const src = state.source || 'yfinance';
+  document.querySelectorAll('#sourcePick .src-opt').forEach(b =>
+    b.classList.toggle('active', b.dataset.source === src));
+  const st = $('srcStatus');
+  if (st) {
+    if (src !== 'kite') { st.textContent = ''; st.className = 'src-status'; }
+    else if (state.kite_connect_active || state.kite_mcp_ready) { st.textContent = '● live'; st.className = 'src-status ok'; }
+    else { st.textContent = 'connect →'; st.className = 'src-status warn'; }
+  }
+}
+
+async function initDataSource() {
+  try { paintSource(await (await fetch('/api/data_source')).json()); } catch (_) {}
+}
+
+async function setDataSource(src) {
+  let j = {};
+  try {
+    j = await (await fetch('/api/data_source', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: src }),
+    })).json();
+  } catch (e) { showToast('Could not change data source: ' + e.message, 'error'); return; }
+  paintSource(j);
+  if (src === 'kite') {
+    if (j.needs_connect) {
+      showToast('Log into Kite to use it for charts — opening login…', 'info');
+      connectKite();            // browser MCP login; on success it becomes the live source
+    } else {
+      showToast('Charts now use Kite. Re-scan or reopen a chart to refetch.', 'success');
+    }
+  } else {
+    showToast('Charts now use yfinance.', 'info');
+  }
+}
+
+document.querySelectorAll('#sourcePick .src-opt').forEach(b =>
+  b.addEventListener('click', () => setDataSource(b.dataset.source)));
+
 initKite();
+initDataSource();
 // Load custom sections in parallel — they may be empty for new users — then
 // restore today's already-processed scan (if any) once sections are available,
 // so custom tabs like "No data" render correctly.

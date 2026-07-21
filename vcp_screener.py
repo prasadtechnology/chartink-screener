@@ -33,18 +33,50 @@ CONFIG = {
 }
 
 
+_src_cache = {'val': None, 't': 0.0}
+
+
+def chart_source():
+    """Selected chart data source: 'kite' or 'yfinance'.
+
+    A saved app setting (toggled in the UI) overrides the DATA_SOURCE env default.
+    Cached for a few seconds so the per-symbol screener doesn't hit the DB each call.
+    """
+    import os
+    import time as _t
+    now = _t.time()
+    if _src_cache['val'] is None or now - _src_cache['t'] > 3:
+        val = 'yfinance'
+        try:
+            import db
+            default = 'kite' if os.environ.get('DATA_SOURCE', '').strip().lower() == 'kite' else 'yfinance'
+            val = db.get_setting('chart_source', default) or default
+        except Exception:
+            val = 'yfinance'
+        _src_cache['val'] = val
+        _src_cache['t'] = now
+    return _src_cache['val']
+
+
 def fetch_ohlc(ticker, days=400, interval='1d'):
-    """Fetch OHLC. interval: '1d', '1wk', '1h'. Uses Kite Connect when configured,
-    otherwise yfinance (which caps 1h at ~730d and needs a wider weekly window)."""
+    """Fetch OHLC. interval: '1d', '1wk', '1h'. Uses Kite when selected (API-key
+    path or the browser-login MCP), otherwise yfinance (which caps 1h at ~730d
+    and needs a wider weekly window). Falls back to yfinance on any Kite failure."""
     min_bars = 30 if interval == '1h' else (40 if interval == '1wk' else 100)
 
-    # Preferred source: Kite (live brokerage feed) when configured + authenticated.
+    # Preferred source: Kite when selected/configured; API key first, else the MCP.
     try:
         import kite_data
-        if kite_data.active():
-            kdf = kite_data.fetch_ohlc(ticker, days=days, interval=interval)
-            if kdf is not None and len(kdf) >= min_bars:
-                return kdf
+        import kite_mcp
+        if chart_source() == 'kite' or kite_data.active():
+            if kite_data.active():
+                kdf = kite_data.fetch_ohlc(ticker, days=days, interval=interval)
+                if kdf is not None and len(kdf) >= min_bars:
+                    return kdf
+            if kite_mcp.data_ready():
+                mdf = kite_mcp.fetch_ohlc(ticker, days=days, interval=interval)
+                if mdf is not None and len(mdf) >= min_bars:
+                    return mdf
             # else fall through to yfinance
     except Exception as e:
         print(f'[kite] fetch_ohlc -> yfinance fallback: {e}')

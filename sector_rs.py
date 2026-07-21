@@ -39,13 +39,20 @@ def fetch_close_series(ticker: str, days: int = 200, _retried: bool = False) -> 
 
     On transient 401/crumb errors we retry once with a fresh session.
     """
-    # Preferred source: Kite Connect when configured + authenticated.
+    # Preferred source: Kite when selected (API-key path or browser-login MCP).
     try:
         import kite_data
-        if kite_data.active():
-            ks = kite_data.fetch_close_series(ticker, days=days)
-            if ks is not None and len(ks) > 0:
-                return ks
+        import kite_mcp
+        from vcp_screener import chart_source
+        if chart_source() == 'kite' or kite_data.active():
+            if kite_data.active():
+                ks = kite_data.fetch_close_series(ticker, days=days)
+                if ks is not None and len(ks) > 0:
+                    return ks
+            if kite_mcp.data_ready():
+                ms = kite_mcp.fetch_close_series(ticker, days=days)
+                if ms is not None and len(ms) > 0:
+                    return ms
     except Exception:
         pass
 

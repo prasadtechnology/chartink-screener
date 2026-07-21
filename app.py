@@ -553,14 +553,55 @@ def kite_mcp_login():
 @login_required
 def kite_mcp_status():
     sid = session.get('kite_mcp_sid')
-    return jsonify({'connected': kite_mcp.is_authenticated(sid) if sid else False})
+    connected = kite_mcp.is_authenticated(sid) if sid else False
+    if connected:
+        # Persist the session for background chart/sector fetchers (which run
+        # outside the request context) to reuse when Kite is the chart source.
+        kite_mcp.set_active_session(sid)
+    return jsonify({'connected': connected})
 
 
 @app.route('/api/kite_mcp/logout', methods=['POST'])
 @login_required
 def kite_mcp_logout():
     session.pop('kite_mcp_sid', None)
+    kite_mcp.clear_active_session()
     return jsonify({'ok': True})
+
+
+# --- Chart data source: yfinance <-> Kite (toggle in the dashboard) -----------
+@app.route('/api/data_source', methods=['GET'])
+@login_required
+def data_source_get():
+    import vcp_screener
+    return jsonify({
+        'source': vcp_screener.chart_source(),
+        'kite_connect_active': kite_data.active(),
+        'kite_mcp_ready': kite_mcp.data_ready(),
+    })
+
+
+@app.route('/api/data_source', methods=['POST'])
+@login_required
+def data_source_set():
+    src = (request.get_json(silent=True) or {}).get('source', 'yfinance')
+    if src not in ('yfinance', 'kite'):
+        return jsonify({'error': 'bad_source'}), 400
+    db.set_setting('chart_source', src)
+    try:                                    # apply immediately (bust the TTL cache)
+        import vcp_screener
+        vcp_screener._src_cache.update(val=src, t=time.time())
+    except Exception:
+        pass
+    # Drop cached bars so charts refetch from the newly-selected provider.
+    try:
+        db.clear_chart_cache()
+    except Exception:
+        pass
+    needs_connect = (src == 'kite' and not kite_data.active() and not kite_mcp.data_ready())
+    return jsonify({'ok': True, 'source': src, 'needs_connect': needs_connect,
+                    'kite_connect_active': kite_data.active(),
+                    'kite_mcp_ready': kite_mcp.data_ready()})
 
 
 @app.route('/api/kite_mcp/sync', methods=['POST'])

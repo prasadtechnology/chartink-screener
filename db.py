@@ -150,6 +150,11 @@ def init_db():
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_breadth_user ON scan_breadth(user_id);
+
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
         ''')
 
         # Migration for older databases
@@ -229,6 +234,14 @@ def set_chart_cache(symbol, exchange, interval, payload):
             (symbol.upper(), exchange.upper(), interval, today,
              json.dumps(payload), int(time.time()))
         )
+
+
+def clear_chart_cache():
+    """Delete ALL cached chart/screen data (e.g. after switching data source),
+    so the next fetch pulls fresh bars from the newly-selected provider."""
+    with get_conn() as conn:
+        cur = conn.execute('DELETE FROM chart_cache')
+        return cur.rowcount
 
 
 def clean_stale_chart_cache(keep_days=2):
@@ -690,6 +703,22 @@ def list_scan_breadth(user_id, limit=365):
             (user_id, limit)
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+# ---------------- App settings (global key/value) ----------------
+def get_setting(key, default=None):
+    with get_conn() as conn:
+        row = conn.execute('SELECT value FROM app_settings WHERE key = ?', (key,)).fetchone()
+        return row['value'] if row else default
+
+
+def set_setting(key, value):
+    with get_conn() as conn:
+        conn.execute(
+            'INSERT INTO app_settings (key, value) VALUES (?, ?) '
+            'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+            (key, str(value))
+        )
 
 
 if __name__ == '__main__':

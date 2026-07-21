@@ -12,8 +12,10 @@ otherwise-stateless requests, which is exactly what a web backend needs.
 """
 import datetime as _dt
 import json
+import os
 import re
 import time
+from pathlib import Path
 
 import requests
 
@@ -276,3 +278,150 @@ def last_price(session_id, exchange, symbol):
         return float(lp) if lp else None
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Historical chart data via the browser-login MCP (no API key)
+# ---------------------------------------------------------------------------
+# The hosted MCP exposes `search_instruments` (symbol -> instrument_token) and
+# `get_historical_data` (candles). We persist the day's session id to a file so
+# background fetchers/threads (screener, sector RS) can reuse it without the
+# Flask request context. This is the free alternative to the Kite Connect data
+# API — used only when the user selects "Kite" as the chart source and has
+# completed the browser login. Falls back to yfinance on any failure.
+_SESSION_PATH = Path(os.environ.get('KITE_MCP_SESSION_PATH', '.kite_mcp_session')).resolve()
+_token_cache = {}                       # "NSE:TCS" -> instrument_token
+_INDEX_MAP = {'^NSEI': 'NSE:NIFTY 50', '^NSEBANK': 'NSE:NIFTY BANK'}
+_INTERVAL = {'1d': 'day', '1h': '60minute'}   # weekly is resampled from daily
+_INTERVAL_MAX_DAYS = {'day': 2000, '60minute': 380}
+
+
+def _today():
+    return _dt.date.today().isoformat()
+
+
+def set_active_session(session_id):
+    """Persist today's authenticated session id for data fetchers to reuse."""
+    if not session_id:
+        return
+    try:
+        _SESSION_PATH.write_text(json.dumps({'date': _today(), 'sid': session_id}))
+    except Exception:
+        pass
+
+
+def active_session():
+    """Return today's persisted MCP session id, or None (expired/absent)."""
+    try:
+        d = json.loads(_SESSION_PATH.read_text())
+        return d.get('sid') if d.get('date') == _today() else None
+    except Exception:
+        return None
+
+
+def clear_active_session():
+    try:
+        _SESSION_PATH.unlink()
+    except Exception:
+        pass
+
+
+def _to_kite_symbol(ticker):
+    if ticker in _INDEX_MAP:
+        return _INDEX_MAP[ticker]
+    t = ticker.strip().upper()
+    if t.endswith('.NS'):
+        return 'NSE:' + t[:-3]
+    if t.endswith('.BO'):
+        return 'BSE:' + t[:-3]
+    return t if ':' in t else 'NSE:' + t
+
+
+def _instrument_token(session_id, kite_symbol):
+    if kite_symbol in _token_cache:
+        return _token_cache[kite_symbol]
+    data = _call_tool_json(session_id, 'search_instruments',
+                           {'query': kite_symbol, 'filter_on': 'id', 'limit': 1})
+    items = data.get('instruments') if isinstance(data, dict) else data
+    tok = None
+    if isinstance(items, list) and items and isinstance(items[0], dict):
+        tok = items[0].get('instrument_token')
+    elif isinstance(data, dict):
+        tok = data.get('instrument_token')
+    if tok:
+        try:
+            _token_cache[kite_symbol] = int(tok)
+            return int(tok)
+        except Exception:
+            return None
+    return None
+
+
+def _candles_to_df(candles):
+    """Kite candles (list of [ts,o,h,l,c,v,...] or dicts) -> OHLCV DataFrame."""
+    import pandas as pd
+    rows = []
+    for c in candles or []:
+        if isinstance(c, (list, tuple)) and len(c) >= 6:
+            rows.append(list(c[:6]))
+        elif isinstance(c, dict):
+            rows.append([c.get('date') or c.get('timestamp'), c.get('open'),
+                         c.get('high'), c.get('low'), c.get('close'), c.get('volume')])
+    if not rows:
+        return None
+    df = pd.DataFrame(rows, columns=['date', 'open', 'high', 'low', 'close', 'volume'])
+    df['date'] = pd.to_datetime(df['date'], utc=True).dt.tz_localize(None)
+    for col in ('open', 'high', 'low', 'close', 'volume'):
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    df = df.dropna(subset=['close']).set_index('date')[['open', 'high', 'low', 'close', 'volume']]
+    return df if not df.empty else None
+
+
+def fetch_ohlc(ticker, days=400, interval='1d'):
+    """OHLC DataFrame via the browser-login MCP, or None. Same shape as
+    vcp_screener.fetch_ohlc so the screener is source-agnostic. Weekly bars are
+    resampled from daily (the MCP interval enum has no 'week')."""
+    sid = active_session()
+    if not sid:
+        return None
+    ksym = _to_kite_symbol(ticker)
+    tok = _instrument_token(sid, ksym)
+    if not tok:
+        return None
+    weekly = interval == '1wk'
+    kint = 'day' if weekly else _INTERVAL.get(interval, 'day')
+    span = days * 7 if weekly else days
+    span = min(span, _INTERVAL_MAX_DAYS.get(kint, 2000))
+    to_dt = _dt.datetime.now()
+    from_dt = to_dt - _dt.timedelta(days=span)
+    fmt = '%Y-%m-%d %H:%M:%S'
+    data = _call_tool_json(sid, 'get_historical_data', {
+        'instrument_token': tok, 'interval': kint,
+        'from_date': from_dt.strftime(fmt), 'to_date': to_dt.strftime(fmt),
+    })
+    candles = None
+    if isinstance(data, dict):
+        candles = data.get('candles') or ((data.get('data') or {}).get('candles')
+                                          if isinstance(data.get('data'), dict) else None)
+    elif isinstance(data, list):
+        candles = data
+    df = _candles_to_df(candles)
+    if df is None:
+        return None
+    if weekly:
+        df = df.resample('W-FRI').agg({'open': 'first', 'high': 'max', 'low': 'min',
+                                       'close': 'last', 'volume': 'sum'}).dropna()
+    return df if not df.empty else None
+
+
+def fetch_close_series(ticker, days=200):
+    df = fetch_ohlc(ticker, days=days, interval='1d')
+    if df is None or df.empty:
+        return None
+    s = df['close'].dropna()
+    return s if not s.empty else None
+
+
+def data_ready():
+    """True when a browser-login session is available for chart data today."""
+    return active_session() is not None

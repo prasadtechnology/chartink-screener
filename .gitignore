@@ -33,6 +33,9 @@ build/
 # Kite Connect daily access token (auto-generated)
 .kite_token
 
+# Kite MCP daily browser-login session id (auto-generated)
+.kite_mcp_session
+
 # Backtest cache and results (machine-generated)
 backtest_cache/
 backtest_results*.json
