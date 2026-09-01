@@ -135,7 +135,11 @@ def start_login():
                           session_id=sid, rid=2))
     except Exception:
         return sid, None
-    m = re.search(r'https://kite\.zerodha\.com/connect/login\S*', _tool_text(obj))
+    # The hosted MCP has changed its login URL over time: older builds returned a
+    # kite.zerodha.com/connect/login link, current ones (v0.3.x) return a
+    # mcp.kite.trade/authorize link. Accept either.
+    m = re.search(r'https://(?:mcp\.kite\.trade/authorize|kite\.zerodha\.com/connect/login)\S*',
+                  _tool_text(obj))
     url = m.group(0).rstrip(').,') if m else None
     return sid, url
 

@@ -2,6 +2,7 @@
 VCP screener — core scoring + entry/stop-loss logic for the web app.
 Extends the CLI version with explicit entry/SL fields and pattern classification.
 """
+import math
 import warnings
 import numpy as np
 import pandas as pd
@@ -93,8 +94,26 @@ def fetch_ohlc(ticker, days=400, interval='1d'):
     if df is None or df.empty or len(df) < min_bars:
         return None
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] for c in df.columns]
-    df.columns = [c.lower() for c in df.columns]
+        # yfinance usually puts the OHLC field names on level 0, but the level
+        # order can vary (sometimes the ticker sits on level 0). Pick whichever
+        # level actually carries the field names, else fall back to level 0.
+        lvl = 0
+        for i in range(df.columns.nlevels):
+            names = {str(x).lower() for x in df.columns.get_level_values(i)}
+            if {'open', 'high', 'low', 'close'} & names:
+                lvl = i
+                break
+        df.columns = df.columns.get_level_values(lvl)
+    df.columns = [str(c).lower() for c in df.columns]
+    # Guard against duplicate columns (e.g. a bad collapse) so df['close'] stays
+    # a Series rather than a DataFrame downstream.
+    df = df.loc[:, ~df.columns.duplicated()]
+    # yfinance often appends a trailing NaN-close row (current in-progress bar /
+    # holiday) which would make the last-bar price and indicators NaN.
+    if 'close' in df.columns:
+        df = df.dropna(subset=['close'])
+    if df.empty or len(df) < min_bars:
+        return None
     return df
 
 
@@ -434,9 +453,16 @@ def score_and_analyse(ticker, cfg=CONFIG):
     if df is None:
         return {'ticker': ticker, 'error': 'Insufficient data', 'score': 0}
 
-    close = df['close']
-    high = df['high']
-    low = df['low']
+    # Defensive: if a data source ever returns duplicate columns, df['close']
+    # is a DataFrame, not a Series — collapse to the first column so the scalar
+    # conversions below can't raise "cannot convert the series to float".
+    def _series(col):
+        s = df[col]
+        return s.iloc[:, 0] if isinstance(s, pd.DataFrame) else s
+
+    close = _series('close')
+    high = _series('high')
+    low = _series('low')
     cur = float(close.iloc[-1])
 
     result = {
@@ -445,6 +471,32 @@ def score_and_analyse(ticker, cfg=CONFIG):
         'notes': [],
         'pass': False,
         'current_price': round(cur, 2),
+    }
+
+    # OHLC data for the frontend chart (last 180 days). Built up-front so the
+    # chart is present even when the analysis short-circuits below (no base, too
+    # few swings, <200d history) — the review UI still needs to draw the chart.
+    last_n = min(180, len(df))
+    df_tail = df.tail(last_n)
+    mas = compute_moving_averages(df)
+
+    def _ma_clean(series):
+        out = []
+        for v in series.tail(last_n):
+            v = float(v)
+            out.append(None if math.isnan(v) else round(v, 2))
+        return out
+
+    result['chart'] = {
+        'dates': df_tail.index.strftime('%Y-%m-%d').tolist(),
+        'open': [round(float(x), 2) for x in df_tail['open']],
+        'high': [round(float(x), 2) for x in df_tail['high']],
+        'low': [round(float(x), 2) for x in df_tail['low']],
+        'close': [round(float(x), 2) for x in df_tail['close']],
+        'volume': [int(x) for x in df_tail['volume']],
+        'ma10': _ma_clean(mas['ma10']),
+        'ma20': _ma_clean(mas['ma20']),
+        'ma50': _ma_clean(mas['ma50']),
     }
 
     # Stage 2
@@ -620,29 +672,6 @@ def score_and_analyse(ticker, cfg=CONFIG):
     if entry_info:
         result.update(entry_info)
 
-    # OHLC data for frontend chart (last 180 days)
-    last_n = min(180, len(df))
-    df_tail = df.tail(last_n)
-    mas = compute_moving_averages(df)
-    def _ma_clean(series):
-        import math
-        out = []
-        for v in series.tail(last_n):
-            v = float(v)
-            out.append(None if math.isnan(v) else round(v, 2))
-        return out
-
-    result['chart'] = {
-        'dates': df_tail.index.strftime('%Y-%m-%d').tolist(),
-        'open': [round(float(x), 2) for x in df_tail['open']],
-        'high': [round(float(x), 2) for x in df_tail['high']],
-        'low': [round(float(x), 2) for x in df_tail['low']],
-        'close': [round(float(x), 2) for x in df_tail['close']],
-        'volume': [int(x) for x in df_tail['volume']],
-        'ma10': _ma_clean(mas['ma10']),
-        'ma20': _ma_clean(mas['ma20']),
-        'ma50': _ma_clean(mas['ma50']),
-    }
     # Base-start date for chart shading
     if base_start_abs < len(df):
         bs_date = df.index[base_start_abs].strftime('%Y-%m-%d')
