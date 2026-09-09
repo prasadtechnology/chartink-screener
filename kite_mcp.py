@@ -346,7 +346,10 @@ def _instrument_token(session_id, kite_symbol):
         return _token_cache[kite_symbol]
     data = _call_tool_json(session_id, 'search_instruments',
                            {'query': kite_symbol, 'filter_on': 'id', 'limit': 1})
-    items = data.get('instruments') if isinstance(data, dict) else data
+    # The hosted MCP returns the match list under 'data' (older builds used
+    # 'instruments'); accept either so a schema change doesn't silently break
+    # token lookup and disable the whole Kite data source.
+    items = (data.get('instruments') or data.get('data')) if isinstance(data, dict) else data
     tok = None
     if isinstance(items, list) and items and isinstance(items[0], dict):
         tok = items[0].get('instrument_token')

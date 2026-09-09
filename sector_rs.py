@@ -28,8 +28,23 @@ def _to_yahoo(symbol: str) -> str:
     return f'{symbol}.NS'
 
 
-def fetch_close_series(ticker: str, days: int = 200, _retried: bool = False) -> Optional[pd.Series]:
+def fetch_close_series(ticker: str, days: int = 200, source: str = 'yfinance',
+                       _retried: bool = False) -> Optional[pd.Series]:
     """Fetch closing prices for a ticker. Returns None on failure.
+
+    `source` selects the data provider and is DELIBERATELY single-valued per call:
+      - 'kite'     : use only the Kite source (API-key path or browser-login MCP);
+                     return None if Kite has no data (NO yfinance fallback).
+      - 'yfinance' : use only yfinance (auto_adjust=True). Default.
+
+    Relative strength compares a basket of stocks against the Nifty benchmark, so
+    every series in one ranking must come from the SAME source, measured over the
+    same window. That is why there is no per-symbol fallback here: mixing Kite
+    (unadjusted) and yfinance (adjusted) — or series that end on different dates —
+    within one ranking corrupts the comparison. The caller (see the sectors
+    endpoint) therefore picks ONE source for the whole run and passes it to the
+    benchmark and every constituent alike; if Kite can't serve the benchmark it
+    switches the entire run to yfinance rather than mixing.
 
     Bulletproof against yfinance's quirky column shapes:
     - MultiIndex with (field, ticker) ordering
@@ -39,22 +54,28 @@ def fetch_close_series(ticker: str, days: int = 200, _retried: bool = False) -> 
 
     On transient 401/crumb errors we retry once with a fresh session.
     """
-    # Preferred source: Kite when selected (API-key path or browser-login MCP).
-    try:
-        import kite_data
-        import kite_mcp
-        from vcp_screener import chart_source
-        if chart_source() == 'kite' or kite_data.active():
-            if kite_data.active():
-                ks = kite_data.fetch_close_series(ticker, days=days)
-                if ks is not None and len(ks) > 0:
-                    return ks
-            if kite_mcp.data_ready():
-                ms = kite_mcp.fetch_close_series(ticker, days=days)
-                if ms is not None and len(ms) > 0:
-                    return ms
-    except Exception:
-        pass
+    if source == 'kite':
+        import time as _t
+        try:
+            import kite_data
+            import kite_mcp
+            # The Kite MCP session drops the occasional request under a long bulk
+            # run (transient, not a real "no data"), so retry a couple of times
+            # with a short backoff before giving up on the symbol.
+            for attempt in range(3):
+                if kite_data.active():
+                    ks = kite_data.fetch_close_series(ticker, days=days)
+                    if ks is not None and len(ks) > 0:
+                        return ks
+                if kite_mcp.data_ready():
+                    ms = kite_mcp.fetch_close_series(ticker, days=days)
+                    if ms is not None and len(ms) > 0:
+                        return ms
+                if attempt < 2:
+                    _t.sleep(0.6)
+        except Exception as e:
+            print(f'[sector_rs] kite fetch_close_series({ticker}) failed: {e}')
+        return None
 
     import time as _time
     try:
@@ -155,7 +176,8 @@ def pct_return(series, lookback: int) -> Optional[float]:
 
 def compute_sector_rankings(lookback: int = LOOKBACK_TRADING_DAYS,
                             nifty_series: Optional[pd.Series] = None,
-                            close_series_by_symbol: Optional[dict] = None):
+                            close_series_by_symbol: Optional[dict] = None,
+                            source: str = 'yfinance'):
     """Rank sectors by relative strength vs Nifty.
 
     Args:
@@ -176,7 +198,7 @@ def compute_sector_rankings(lookback: int = LOOKBACK_TRADING_DAYS,
     """
     # Fetch Nifty if not provided
     if nifty_series is None:
-        nifty_series = fetch_close_series(NIFTY_TICKER, days=lookback + 30)
+        nifty_series = fetch_close_series(NIFTY_TICKER, days=lookback + 30, source=source)
     nifty_ret = pct_return(nifty_series, lookback)
     if nifty_ret is None or nifty_ret == 0:
         return []
@@ -188,7 +210,7 @@ def compute_sector_rankings(lookback: int = LOOKBACK_TRADING_DAYS,
             if close_series_by_symbol is not None:
                 series = close_series_by_symbol.get(sym)
             else:
-                series = fetch_close_series(_to_yahoo(sym), days=lookback + 30)
+                series = fetch_close_series(_to_yahoo(sym), days=lookback + 30, source=source)
             ret = pct_return(series, lookback)
             if ret is None:
                 continue

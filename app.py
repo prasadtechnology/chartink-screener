@@ -1176,10 +1176,27 @@ def sectors_leaders():
             cached['_cached'] = True
             return jsonify(cached)
 
-    # Cache miss — fetch everything
-    nifty_series = fetch_close_series(NIFTY_TICKER, days=lookback + 30)
+    # Pick ONE source for the whole ranking run — never mix per-symbol. Relative
+    # strength only makes sense when the benchmark and every constituent come from
+    # the same provider over the same window. Use Kite when it's the selected,
+    # available source; otherwise yfinance.
+    source = 'yfinance'
+    try:
+        import vcp_screener
+        if vcp_screener.chart_source() == 'kite' and (kite_data.active() or kite_mcp.data_ready()):
+            source = 'kite'
+    except Exception:
+        pass
+
+    # Cache miss — fetch the benchmark first. If Kite can't serve it, switch the
+    # WHOLE run to yfinance rather than mixing sources.
+    nifty_series = fetch_close_series(NIFTY_TICKER, days=lookback + 30, source=source)
+    if source == 'kite' and (nifty_series is None or len(nifty_series) == 0):
+        print('[sectors] Kite could not serve Nifty benchmark — falling back to yfinance for the whole run')
+        source = 'yfinance'
+        nifty_series = fetch_close_series(NIFTY_TICKER, days=lookback + 30, source=source)
     if nifty_series is None or len(nifty_series) == 0:
-        return jsonify({'error': 'Could not fetch Nifty data — Yahoo may be rate-limiting. Try again in a minute.'}), 503
+        return jsonify({'error': 'Could not fetch Nifty data — the data source may be rate-limiting. Try again in a minute.'}), 503
 
     all_syms = set()
     for stocks in SECTOR_CONSTITUENTS.values():
@@ -1190,11 +1207,16 @@ def sectors_leaders():
 
     def fetch_one(sym):
         # Small jitter to space requests out and avoid Yahoo's burst limit
-        time.sleep(0.15)
-        return sym, fetch_close_series(f'{sym}.NS', days=lookback + 30)
+        if source == 'yfinance':
+            time.sleep(0.15)
+        return sym, fetch_close_series(f'{sym}.NS', days=lookback + 30, source=source)
 
-    # Reduced from 6 → 3 workers; Yahoo throttles parallel hits
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+    # yfinance tolerates a few parallel hits (3 workers); the Kite MCP uses one
+    # stateful session that fails under concurrent/burst requests, so fetch Kite
+    # SERIALLY (1 worker). Serial Kite is ~0.5s/symbol but 100% reliable, and the
+    # result is cached for the trading day.
+    workers = 3 if source == 'yfinance' else 1
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
         for sym, series in ex.map(fetch_one, sorted(all_syms)):
             if series is not None and len(series) > 0:
                 series_by_symbol[sym] = series
@@ -1205,6 +1227,7 @@ def sectors_leaders():
         lookback=lookback,
         nifty_series=nifty_series,
         close_series_by_symbol=series_by_symbol,
+        source=source,
     )
     payload = {
         'lookback_days': lookback,
@@ -1213,6 +1236,7 @@ def sectors_leaders():
         'failed_symbols': failed_syms,
         'fetched_count': len(series_by_symbol),
         'total_count': len(all_syms),
+        'data_source': source,
     }
 
     # Persist to cache (non-fatal if it fails)
