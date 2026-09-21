@@ -1100,7 +1100,8 @@ def drawings_add(symbol):
     exchange = data.get('exchange', 'NSE')
     if not type_ or not isinstance(points, list) or not points:
         return jsonify({'error': 'Missing type or points'}), 400
-    new_id = db.add_drawing(current_user_id(), symbol, exchange, type_, name, color, points)
+    new_id = db.add_drawing(current_user_id(), symbol, exchange, type_, name, color, points,
+                            line_width=data.get('line_width', 0), line_style=data.get('line_style', ''))
     return jsonify({'id': new_id, 'ok': True})
 
 

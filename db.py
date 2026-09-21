@@ -168,6 +168,12 @@ def init_db():
         # Long-term hold flag: no stop expected, excluded from open-risk & R math.
         if _table_exists(conn, 'holdings') and not _column_exists(conn, 'holdings', 'long_term'):
             conn.execute("ALTER TABLE holdings ADD COLUMN long_term INTEGER NOT NULL DEFAULT 0")
+        # Drawing line width (0 = the tool's default) and style ('' / solid / dashed / dotted).
+        if _table_exists(conn, 'drawings'):
+            if not _column_exists(conn, 'drawings', 'line_width'):
+                conn.execute("ALTER TABLE drawings ADD COLUMN line_width REAL NOT NULL DEFAULT 0")
+            if not _column_exists(conn, 'drawings', 'line_style'):
+                conn.execute("ALTER TABLE drawings ADD COLUMN line_style TEXT NOT NULL DEFAULT ''")
         # Dedup key for trades imported from Kite ("Pull journal from Kite").
         # Add the column first (older DBs lack it), then build the unique index —
         # doing it here (not in the CREATE block above) guarantees the column
@@ -524,22 +530,39 @@ def list_drawings(user_id, symbol=None):
         return out
 
 
-def add_drawing(user_id, symbol, exchange, type_, name, color, points):
+_LINE_STYLES = {'', 'solid', 'dashed', 'dotted'}
+
+
+def _clean_line_width(v):
+    try:
+        v = float(v or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0.0, min(8.0, v))
+
+
+def add_drawing(user_id, symbol, exchange, type_, name, color, points, line_width=0, line_style=''):
+    line_style = line_style if line_style in _LINE_STYLES else ''
     with get_conn() as conn:
         cur = conn.execute(
-            'INSERT INTO drawings (user_id, symbol, exchange, type, name, color, points_json, created_at) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            'INSERT INTO drawings (user_id, symbol, exchange, type, name, color, points_json, created_at, '
+            'line_width, line_style) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (user_id, symbol.upper(), (exchange or 'NSE').upper(), type_, name or '',
-             color or '#2563eb', json.dumps(points), int(time.time()))
+             color or '#2563eb', json.dumps(points), int(time.time()),
+             _clean_line_width(line_width), line_style)
         )
         return cur.lastrowid
 
 
 def update_drawing(user_id, id_, fields):
     """Update name/color/points on an existing drawing owned by user."""
-    allowed = {'name', 'color', 'points_json'}
+    allowed = {'name', 'color', 'points_json', 'line_width', 'line_style'}
     if 'points' in fields:
         fields['points_json'] = json.dumps(fields.pop('points'))
+    if 'line_width' in fields:
+        fields['line_width'] = _clean_line_width(fields['line_width'])
+    if 'line_style' in fields and fields['line_style'] not in _LINE_STYLES:
+        fields.pop('line_style')
     fields = {k: v for k, v in fields.items() if k in allowed}
     if not fields:
         return False

@@ -80,15 +80,20 @@ function rotateMsg(root, msgs) {
 // Toasts — non-blocking transient feedback (replaces alert() for messages).
 // type: 'info' | 'success' | 'error'. Auto-dismisses; click × to close early.
 // ---------------------------------------------------------------------------
-function showToast(message, type = 'info', timeout = 3400) {
+function showToast(message, type = 'info', timeout = 3400, action = null) {
   const host = $('toastHost');
   if (!host) { console.warn('[toast]', message); return; }
   const el = document.createElement('div');
   el.className = `toast toast-${type}`;
   el.setAttribute('role', type === 'error' ? 'alert' : 'status');
   const mark = type === 'success' ? svgIcon('check', 16) : type === 'error' ? svgIcon('alertTriangle', 16) : svgIcon('info', 16);
-  el.innerHTML = `<span class="toast-icon">${mark}</span><span class="toast-msg"></span><button class="toast-x" aria-label="Dismiss">${svgIcon('x', 15)}</button>`;
+  el.innerHTML = `<span class="toast-icon">${mark}</span><span class="toast-msg"></span>${action ? '<button class="toast-action"></button>' : ''}<button class="toast-x" aria-label="Dismiss">${svgIcon('x', 15)}</button>`;
   el.querySelector('.toast-msg').textContent = message;   // textContent — never HTML
+  if (action) {
+    const btn = el.querySelector('.toast-action');
+    btn.textContent = action.label;
+    btn.addEventListener('click', () => { try { action.fn(); } finally { dismiss(); } });
+  }
   let done = false;
   const dismiss = () => {
     if (done) return;
@@ -174,6 +179,36 @@ dropzone.addEventListener('drop', (e) => {
   handleFiles(e.dataTransfer.files);
 });
 fileInput.addEventListener('change', (e) => handleFiles(e.target.files));
+dropzone.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInput.click(); }
+});
+
+// Page-wide drop target: drag a CSV anywhere on the Scan tab (the dropzone in
+// the toolbar is small, so the whole window accepts the drop).
+(function initPageDrop() {
+  const overlay = $('dropOverlay');
+  let depth = 0;
+  const hasFiles = (e) => Array.from(e.dataTransfer?.types || []).includes('Files');
+  const onScan = () => !$('scanView').classList.contains('hidden') && $('modal').classList.contains('hidden');
+  window.addEventListener('dragenter', (e) => {
+    if (!hasFiles(e) || !onScan()) return;
+    depth++;
+    overlay?.classList.remove('hidden');
+  });
+  window.addEventListener('dragleave', () => {
+    depth = Math.max(0, depth - 1);
+    if (!depth) overlay?.classList.add('hidden');
+  });
+  window.addEventListener('dragover', (e) => { if (hasFiles(e) && onScan()) e.preventDefault(); });
+  window.addEventListener('drop', (e) => {
+    depth = 0;
+    overlay?.classList.add('hidden');
+    if (!hasFiles(e) || !onScan()) return;
+    if (e.target.closest && e.target.closest('#dropzone')) return;   // dropzone handles its own
+    e.preventDefault();
+    handleFiles(e.dataTransfer.files);
+  });
+})();
 
 // ---------------------------------------------------------------------------
 // Scan session persistence — keep today's processed CSVs across reloads
@@ -387,10 +422,71 @@ async function startBrowseMode(symbols) {
     showToast('No symbols loaded. Drop a CSV first.', 'info');
     return;
   }
-  state.browseList = symbols.map(s => ({ input_symbol: s, ticker: `${s}.NS` }));
+  // Seed from today's scan results where we have them, so the list shows
+  // price / pivot distance immediately and those charts open instantly.
+  const known = {};
+  (state.results || []).forEach(r => { if (r && r.input_symbol && r.chart && !r.error) known[r.input_symbol] = r; });
+  state.browseList = symbols.map(s => known[s] || { input_symbol: s, ticker: `${s}.NS` });
   state.browseIndex = 0;
   state.browseDecisions = {};
+  const gen = ++_browseGen;
   await openBrowseAt(0);
+  prefetchBrowseList(gen);
+}
+
+// ---------------------------------------------------------------------------
+// Background prefetch for the browse list: fills in price / pivot distance for
+// every symbol (and makes J/K instant). Nearest-upcoming symbols first, two
+// requests at a time. Results are cached server-side for the day, so this is
+// cheap after a scan. Stops as soon as browse mode is exited or restarted.
+// ---------------------------------------------------------------------------
+let _browseGen = 0;
+let _blRenderPending = false;
+function scheduleBrowseListRender() {
+  if (_blRenderPending) return;
+  _blRenderPending = true;
+  setTimeout(() => { _blRenderPending = false; if (state.browseIndex >= 0) renderBrowseList(); }, 250);
+}
+function isBrowseLoaded(r) { return !!(r && (r.chart || r.error || r.no_data)); }
+
+async function prefetchBrowseList(gen) {
+  const alive = () => gen === _browseGen && state.browseIndex >= 0;
+  const inFlight = new Set();
+  const nextIdx = () => {
+    const n = state.browseList.length, from = Math.max(0, state.browseIndex);
+    for (let k = 1; k <= n; k++) {           // walk forward from the current chart, wrapping
+      const i = (from + k) % n;
+      if (!isBrowseLoaded(state.browseList[i]) && !inFlight.has(i)) return i;
+    }
+    return -1;
+  };
+  async function worker() {
+    while (alive()) {
+      const i = nextIdx();
+      if (i < 0) return;
+      inFlight.add(i);
+      const sym = browseSymOf(state.browseList[i]);
+      try {
+        const res = await fetch('/api/screen_one', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ symbol: sym, exchange: 'NSE' }),
+        });
+        const data = await res.json();
+        if (!alive()) return;
+        data.input_symbol = sym;
+        // Don't clobber a copy openBrowseAt already fetched (e.g. a forced refresh)
+        if (!isBrowseLoaded(state.browseList[i])) state.browseList[i] = data;
+        scheduleBrowseListRender();
+      } catch (e) {
+        if (!alive()) return;
+        state.browseList[i] = { ...state.browseList[i], error: String(e.message || e), _prefetchFailed: true };
+      } finally {
+        inFlight.delete(i);
+      }
+      await new Promise(r => setTimeout(r, 120));   // be gentle with the data source
+    }
+  }
+  await Promise.all([worker(), worker()]);
 }
 
 // "No data" section — collects symbols unavailable on both NSE and BSE.
@@ -433,7 +529,7 @@ async function openBrowseAt(idx, forceRefresh = false) {
 
   // Cache: if we already have full data for this symbol, use it instantly
   // (data has chart info => already fetched). forceRefresh bypasses cache.
-  if (!forceRefresh && stub.chart && stub.score !== undefined) {
+  if (!forceRefresh && stub.chart && stub.score !== undefined && !stub.error) {
     openModal(stub);
     augmentModalForBrowse();
     return;
@@ -454,33 +550,114 @@ async function openBrowseAt(idx, forceRefresh = false) {
     });
     const data = await r.json();
     data.input_symbol = stub.input_symbol;
+    if (state.browseIndex < 0) return;                  // browse was exited meanwhile
     state.browseList[idx] = data;
     if (data.no_data) {
       const moved = await moveToNoDataSection(stub.input_symbol);
       if (moved) showToast(`${stub.input_symbol}: no data on NSE or BSE — moved to "No data".`, 'info');
     }
+    // User already pressed J/K past this symbol — keep the data, don't yank the view back
+    if (state.browseIndex !== idx) { scheduleBrowseListRender(); return; }
     openModal(data);
     augmentModalForBrowse();
   } catch (e) {
+    if (state.browseIndex < 0) return;
     state.browseList[idx] = { ...stub, error: e.message };
+    if (state.browseIndex !== idx) return;
     openModal(state.browseList[idx]);
     augmentModalForBrowse();
   }
 }
 
+// ---------------------------------------------------------------------------
+// Chart workstation layout
+//   .ws            grid: [browse list] [main: head / toolbar / chart / keys] [side panel]
+//   #browseBar     left symbol list (browse mode only)
+//   #wsDecision    skip / interested / move-to (browse mode only)
+//   #wsInfo        key stats + per-symbol notes (always)
+// ---------------------------------------------------------------------------
+function browseSymOf(r) {
+  return r?.input_symbol || (r?.ticker || '').replace(/\.(NS|BO)$/, '');
+}
+
 function setBrowseModalLoading(stub) {
+  const sym = browseSymOf(stub);
   $('modalContent').innerHTML = `
-    <div class="modal-head">
-      <div>
-        <div class="modal-ticker">${stub.input_symbol}</div>
-        <div class="modal-pattern">Loading…</div>
+    <div class="ws">
+      <div class="ws-main">
+        <div class="modal-head ws-head"><span class="mh-tk">${esc(sym)}</span><span class="mh-loading">Loading…</span></div>
+        <div class="ws-loading">${loaderHTML(`Fetching chart data for ${sym}…`)}</div>
       </div>
-    </div>
-    <div style="padding:3rem;text-align:center;color:var(--text-faint)">
-      Fetching chart data for <b>${stub.input_symbol}</b>…
-    </div>
-  `;
+    </div>`;
   $('modal').classList.remove('hidden');
+  if (state.browseIndex >= 0) renderBrowseList();
+}
+
+function sectionFor(sym) {
+  const ids = state.assignments?.[sym] || [];
+  return ids.length ? (state.customSections || []).find(s => s.id === ids[0]) || null : null;
+}
+
+// Left column: every symbol in the browse list, with price / decision / section.
+function renderBrowseList() {
+  const ws = document.querySelector('#modalContent .ws');
+  if (!ws) return;
+  const old = document.getElementById('browseBar');
+  const prevScroll = old?.querySelector('.bl-rows')?.scrollTop ?? null;
+  old?.remove();
+
+  const idx = state.browseIndex;
+  const total = state.browseList.length;
+  const rows = state.browseList.map((r, i) => {
+    const sym = browseSymOf(r);
+    const dec = state.browseDecisions[sym];
+    const sec = sectionFor(sym);
+    const px = r.current_price != null ? Number(r.current_price).toLocaleString('en-IN', { maximumFractionDigits: 2 }) : '';
+    let piv = '';
+    if (r.no_data || (r.error && !r.chart)) piv = '<span class="muted">no data</span>';
+    else if (r.pct_from_pivot != null) {
+      piv = r.pct_from_pivot < 0
+        ? `<span class="pos">+${(-r.pct_from_pivot).toFixed(1)}%</span>`
+        : `<span class="${r.pct_from_pivot <= 3 ? 'near' : ''}">−${r.pct_from_pivot.toFixed(1)}%</span>`;
+    }
+    const mark = dec === 'interested' ? `<span class="bl-mark interested" title="Interested">${svgIcon('star', 12)}</span>`
+               : dec === 'skip' ? '<span class="bl-mark skip" title="Skipped">skip</span>' : '';
+    return `<button class="bl-row ${i === idx ? 'active' : ''} ${dec === 'skip' ? 'is-skip' : ''}" data-i="${i}">
+      <span class="bl-sym">${sec ? `<span class="bl-dot" style="background:${esc(sec.color)}" title="${esc(sec.name)}"></span>` : ''}${esc(sym)}${mark}</span>
+      <span class="bl-num"><span>${px}</span>${piv}</span>
+    </button>`;
+  }).join('');
+
+  const interested = Object.values(state.browseDecisions).filter(d => d === 'interested').length;
+  const loaded = state.browseList.filter(isBrowseLoaded).length;
+  const aside = document.createElement('aside');
+  aside.id = 'browseBar';
+  aside.className = 'ws-list';
+  aside.innerHTML = `
+    <div class="bl-head">
+      <span class="bl-title">Browse</span>
+      <span class="bl-pos"><b>${idx + 1}</b> / ${total}</span>
+      <button class="icon-btn" id="browseExit" title="Exit browse (Esc)" aria-label="Exit browse">${svgIcon('x', 15)}</button>
+    </div>
+    <div class="bl-rows">${rows}</div>
+    <div class="bl-foot">
+      ${interested ? `<b>${interested}</b> marked interested` : 'Press <kbd>I</kbd> to mark interesting charts'}
+      ${loaded < total ? `<span class="bl-loading" title="Loading prices for the rest of the list">${loaded}/${total} loaded</span>` : ''}
+    </div>`;
+  ws.insertBefore(aside, ws.firstChild);
+  ws.classList.add('has-list');
+
+  aside.querySelector('#browseExit').addEventListener('click', exitBrowseMode);
+  aside.querySelectorAll('.bl-row').forEach(b =>
+    b.addEventListener('click', () => openBrowseAt(parseInt(b.dataset.i, 10))));
+  const list = aside.querySelector('.bl-rows');
+  if (prevScroll != null) list.scrollTop = prevScroll;
+  // Only auto-scroll when the active symbol changes, so background updates
+  // don't yank the list while you're scrolling it yourself.
+  if (renderBrowseList._lastActive !== idx || prevScroll == null) {
+    aside.querySelector('.bl-row.active')?.scrollIntoView({ block: 'nearest' });
+    renderBrowseList._lastActive = idx;
+  }
 }
 
 function augmentModalForBrowse() {
@@ -488,229 +665,120 @@ function augmentModalForBrowse() {
   const total = state.browseList.length;
   const idx = state.browseIndex;
   const r = state.browseList[idx];
-  const sym = r?.input_symbol;
+  const sym = browseSymOf(r);
   const decision = state.browseDecisions[sym];
 
-  // Hide non-essential UI in browse mode — chart-first
   document.getElementById('modal')?.classList.add('browse-mode');
+  renderBrowseList();
 
-  // Find which section the symbol is in
-  const assignedIds = state.assignments?.[sym] || [];
-  const assignedSection = assignedIds.length
-    ? state.customSections.find(s => s.id === assignedIds[0])
-    : null;
-
-  // Build sections-dropdown options
+  // Decision block at the top of the side panel
+  const assignedSection = sectionFor(sym);
   const sections = state.customSections || [];
-  const sectionOptions = sections.map(s =>
-    `<option value="${s.id}" ${assignedSection?.id === s.id ? 'selected' : ''}>${esc(s.name)}</option>`
-  ).join('');
-
-  // Inject a browse-bar at the very top
-  document.getElementById('browseBar')?.remove();
-  const bar = document.createElement('div');
-  bar.id = 'browseBar';
-  bar.className = 'browse-bar';
-  bar.innerHTML = `
-    <button class="browse-nav-btn" id="browsePrev" title="Previous (←  or  k)" ${idx === 0 ? 'disabled' : ''}>${svgIcon('arrowLeft')}</button>
-    <div class="browse-progress">
-      <span class="browse-pos"><b>${idx + 1}</b>/${total}</span>
-      <span class="browse-sym">${sym}</span>
-      ${assignedSection ? `<span class="browse-section-pill" style="--bc:${assignedSection.color}">${esc(assignedSection.name)}</span>` : ''}
-    </div>
-    <div class="browse-actions">
-      <button class="browse-action skip ${decision === 'skip' ? 'on' : ''}" data-action="skip" title="Skip (s)">Skip</button>
-      <button class="browse-action interested ${decision === 'interested' ? 'on' : ''}" data-action="interested" title="Mark interested (i)">${svgIcon('star', 16)}</button>
-      <select class="browse-section-select" id="browseSectionSelect" title="Move to section">
-        <option value="">Move to…</option>
-        ${sectionOptions}
+  const dec = document.getElementById('wsDecision');
+  if (dec) {
+    dec.classList.remove('hidden');
+    dec.innerHTML = `
+      <div class="ws-sec-head"><h4>Decision</h4>
+        <span class="ws-nav">
+          <button class="icon-btn" id="browsePrev" title="Previous (K / ←)" aria-label="Previous" ${idx === 0 ? 'disabled' : ''}>${svgIcon('arrowLeft', 15)}</button>
+          <button class="icon-btn" id="browseNext" title="Next (J / →)" aria-label="Next" ${idx === total - 1 ? 'disabled' : ''}>${svgIcon('arrowRight', 15)}</button>
+        </span>
+      </div>
+      <div class="decision-row">
+        <button class="browse-action interested ${decision === 'interested' ? 'on' : ''}" data-action="interested" title="Mark interested (I)">${svgIcon('star', 14)} Interested <kbd>I</kbd></button>
+        <button class="browse-action skip ${decision === 'skip' ? 'on' : ''}" data-action="skip" title="Skip (S)">Skip <kbd>S</kbd></button>
+      </div>
+      <label class="field-label" for="browseSectionSelect">Section</label>
+      <select class="browse-section-select" id="browseSectionSelect">
+        <option value="">${assignedSection ? '' : 'Not in a section'}</option>
+        ${sections.map(s => `<option value="${s.id}" ${assignedSection?.id === s.id ? 'selected' : ''}>${esc(s.name)}</option>`).join('')}
         <option value="__new__">+ New section…</option>
-        ${assignedSection ? `<option value="__remove__">× Remove from "${esc(assignedSection.name)}"</option>` : ''}
-      </select>
-      <button class="browse-icon-btn" id="browseInfoToggle" title="Toggle info panel (key stats, notes, indicators)">${svgIcon('info')}</button>
-      <button class="browse-icon-btn" id="browseRefresh" title="Refresh chart data from server">${svgIcon('refresh')}</button>
-    </div>
-    <button class="browse-nav-btn" id="browseNext" title="Next (→  or  j)" ${idx === total - 1 ? 'disabled' : ''}>${svgIcon('arrowRight')}</button>
-    <button class="browse-exit-btn" id="browseExit" title="Exit (Esc)">${svgIcon('x')}</button>
-  `;
-  const modalContent = document.getElementById('modalContent');
-  modalContent.insertBefore(bar, modalContent.firstChild);
+        ${assignedSection ? `<option value="__remove__">Remove from “${esc(assignedSection.name)}”</option>` : ''}
+      </select>`;
+    if (assignedSection) dec.querySelector('#browseSectionSelect option[value=""]').remove();
 
-  document.getElementById('browsePrev').addEventListener('click', () => openBrowseAt(idx - 1));
-  document.getElementById('browseNext').addEventListener('click', () => openBrowseAt(idx + 1));
-  document.getElementById('browseExit').addEventListener('click', exitBrowseMode);
-  document.getElementById('browseRefresh').addEventListener('click', () => openBrowseAt(idx, true));
-  document.getElementById('browseInfoToggle').addEventListener('click', toggleBrowseInfoPanel);
-  bar.querySelectorAll('.browse-action').forEach(b => {
-    b.addEventListener('click', () => markBrowseDecision(b.dataset.action));
-  });
-  document.getElementById('browseSectionSelect').addEventListener('change', async (e) => {
-    const val = e.target.value;
-    if (!val) return;
-    if (val === '__new__') {
-      e.target.value = '';
-      openSectionEditor(null);
-      return;
-    }
-    if (val === '__remove__') {
-      await moveCardToSection(sym, null);
-    } else {
-      await moveCardToSection(sym, parseInt(val, 10));
-    }
-    augmentModalForBrowse();
-  });
-
-  // Build (but don't show) the info panel — toggle via ⓘ button
-  buildBrowseInfoPanel();
-}
-
-function toggleBrowseInfoPanel() {
-  const panel = document.getElementById('browseInfoPanel');
-  if (!panel) return;
-  panel.classList.toggle('open');
-}
-
-function exitBrowseMode() {
-  state.browseIndex = -1;
-  state.browseList = [];
-  document.getElementById('modal')?.classList.remove('browse-mode');
-  closeModal();
-}
-
-function markBrowseDecision(decision) {
-  const sym = state.browseList[state.browseIndex]?.input_symbol;
-  if (!sym) return;
-  if (state.browseDecisions[sym] === decision) {
-    delete state.browseDecisions[sym];
-  } else {
-    state.browseDecisions[sym] = decision;
-  }
-  // Just update the bar buttons, don't rebuild the whole augment
-  document.querySelectorAll('.browse-action').forEach(b => {
-    const isOn = state.browseDecisions[sym] === b.dataset.action;
-    b.classList.toggle('on', isOn);
-  });
-}
-
-function buildBrowseInfoPanel() {
-  const r = state.browseList[state.browseIndex];
-  if (!r) return;
-
-  let panel = document.getElementById('browseInfoPanel');
-  if (!panel) {
-    panel = document.createElement('div');
-    panel.id = 'browseInfoPanel';
-    panel.className = 'browse-info-panel';
-    // Float over the chart on the right edge
-    const detailChart = document.getElementById('detailChart');
-    if (detailChart) {
-      detailChart.appendChild(panel);
-    }
+    dec.querySelector('#browsePrev').addEventListener('click', () => openBrowseAt(idx - 1));
+    dec.querySelector('#browseNext').addEventListener('click', () => openBrowseAt(idx + 1));
+    dec.querySelectorAll('.browse-action').forEach(b =>
+      b.addEventListener('click', () => markBrowseDecision(b.dataset.action)));
+    dec.querySelector('#browseSectionSelect').addEventListener('change', async (e) => {
+      const val = e.target.value;
+      if (!val) return;
+      if (val === '__new__') { e.target.value = assignedSection ? String(assignedSection.id) : ''; openSectionEditor(null); return; }
+      await moveCardToSection(sym, val === '__remove__' ? null : parseInt(val, 10));
+      augmentModalForBrowse();
+    });
   }
 
-  if (r.error) {
-    panel.innerHTML = `<div class="bip-empty">No data — ${esc(r.error)}</div>`;
-    return;
+  // Refresh button + position in the chart header
+  const actions = document.getElementById('wsHeadActions');
+  if (actions && !actions.querySelector('#browseRefresh')) {
+    actions.insertAdjacentHTML('afterbegin',
+      `<button class="icon-btn" id="browseRefresh" title="Re-fetch chart data" aria-label="Re-fetch chart data">${svgIcon('refresh', 15)}</button>`);
+    actions.querySelector('#browseRefresh').addEventListener('click', () => openBrowseAt(idx, true));
   }
 
-  const closes = r.chart?.close || [];
+  // Keyboard hints under the chart
+  const keys = document.getElementById('wsKeys');
+  if (keys) {
+    keys.classList.remove('hidden');
+    keys.innerHTML = `
+      <span><kbd>J</kbd><kbd>K</kbd> next / prev</span>
+      <span><kbd>I</kbd> interested</span>
+      <span><kbd>S</kbd> skip</span>
+      <span><kbd>F</kbd> focus chart</span>
+      <span><kbd>Esc</kbd> exit</span>
+      <span class="ws-keys-right">scroll to zoom · drag to pan</span>`;
+  }
+}
+
+// Side-panel "Stats" + notes. Works for any open chart, browse mode or not.
+function buildInfoPanel(r) {
+  const panel = document.getElementById('wsInfo');
+  if (!panel || !r || r.error) return;
+  const sym = browseSymOf(r);
   const highs = r.chart?.high || [];
   const lows = r.chart?.low || [];
   const volumes = r.chart?.volume || [];
 
-  // ADR(20)
-  let adr = '—';
-  if (highs.length >= 20) {
-    const last20H = highs.slice(-20);
-    const last20L = lows.slice(-20);
-    const ranges = last20H.map((h, i) => last20L[i] > 0 ? (h - last20L[i]) / last20L[i] * 100 : 0);
+  let adr = r.adr_pct != null ? r.adr_pct + '%' : '—';
+  if (adr === '—' && highs.length >= 20) {
+    const h20 = highs.slice(-20), l20 = lows.slice(-20);
+    const ranges = h20.map((h, i) => l20[i] > 0 ? (h - l20[i]) / l20[i] * 100 : 0);
     adr = (ranges.reduce((a, b) => a + b, 0) / ranges.length).toFixed(2) + '%';
   }
-
   let avgVol50 = '—';
   if (volumes.length >= 50) {
     const v = volumes.slice(-50);
     const mean = v.reduce((a, b) => a + b, 0) / v.length;
     avgVol50 = mean >= 1e6 ? (mean / 1e6).toFixed(1) + 'M' : (mean / 1e3).toFixed(0) + 'K';
   }
-
-  const distFromMa50 = r.pct_from_ma50 != null ? `${r.pct_from_ma50 > 0 ? '+' : ''}${r.pct_from_ma50.toFixed(1)}%` : '—';
-
-  // Compute live indicators from chart data
-  const rsi = closes.length >= 15 ? calcRSI(closes, 14) : null;
-  const macd = closes.length >= 35 ? calcMACD(closes) : null;
-
-  const rsiClass = rsi == null ? '' : (rsi >= 70 ? 'rsi-overbought' : (rsi <= 30 ? 'rsi-oversold' : 'rsi-neutral'));
-  const rsiState = rsi == null ? '—' : (rsi >= 70 ? 'OB' : (rsi <= 30 ? 'OS' : 'Mid'));
-  const macdCross = macd ? (macd.macd > macd.signal ? 'Bull' : 'Bear') : '—';
-  const macdCrossClass = macd ? (macd.macd > macd.signal ? 'pos' : 'neg') : '';
+  const inr = v => v == null ? '—' : Number(v).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+  const distMa50 = r.pct_from_ma50 != null ? `${r.pct_from_ma50 > 0 ? '+' : ''}${r.pct_from_ma50.toFixed(1)}%` : '—';
+  const row = (l, v, sub = '') => `<div class="kv"><span>${l}</span><b>${v}${sub ? `<i>${sub}</i>` : ''}</b></div>`;
 
   panel.innerHTML = `
-    <div class="bip-head">
-      <span>${r.input_symbol}</span>
-      <button class="bip-close" id="bipClose">×</button>
-    </div>
-    <div class="bip-body">
-      <div class="bip-row">
-        <span class="bip-l">CMP</span>
-        <span class="bip-v">₹${r.current_price?.toLocaleString('en-IN') ?? '—'}</span>
-      </div>
-      <div class="bip-row">
-        <span class="bip-l">52w hi</span>
-        <span class="bip-v">₹${r.high_52w?.toLocaleString('en-IN') ?? '—'} <em>${r.pct_from_52w_high != null ? '−' + r.pct_from_52w_high.toFixed(1) + '%' : ''}</em></span>
-      </div>
-      <div class="bip-row">
-        <span class="bip-l">52w lo</span>
-        <span class="bip-v">₹${r.low_52w?.toLocaleString('en-IN') ?? '—'} <em>${r.pct_above_52w_low != null ? '+' + r.pct_above_52w_low.toFixed(1) + '%' : ''}</em></span>
-      </div>
-      <div class="bip-row">
-        <span class="bip-l">ADR(20)</span>
-        <span class="bip-v">${adr}</span>
-      </div>
-      <div class="bip-row">
-        <span class="bip-l">Avg vol 50d</span>
-        <span class="bip-v">${avgVol50}</span>
-      </div>
-      <div class="bip-row">
-        <span class="bip-l">vs MA50</span>
-        <span class="bip-v">${distFromMa50}</span>
-      </div>
-      <div class="bip-row">
-        <span class="bip-l">ATR ratio</span>
-        <span class="bip-v">${r.atr_ratio ?? '—'}</span>
-      </div>
-      <div class="bip-row">
-        <span class="bip-l">RSI(14)</span>
-        <span class="bip-v ${rsiClass}">${rsi == null ? '—' : rsi.toFixed(0)} <em>${rsiState}</em></span>
-      </div>
-      <div class="bip-row">
-        <span class="bip-l">MACD</span>
-        <span class="bip-v ${macdCrossClass}">${macdCross}</span>
-      </div>
-      <div class="bip-divider"></div>
-      <div class="bip-section">
-        <div class="bip-section-head">My notes</div>
-        <textarea class="bip-notes" id="symbolNotes" placeholder="Conviction, observations…">${getSymbolNote(r.input_symbol)}</textarea>
-      </div>
-    </div>
-  `;
-
-  document.getElementById('bipClose').addEventListener('click', () => {
-    panel.classList.remove('open');
-  });
-  document.getElementById('symbolNotes')?.addEventListener('input', (e) => {
-    setSymbolNote(r.input_symbol, e.target.value);
-  });
+    <div class="ws-sec-head"><h4>Stats</h4></div>
+    ${row('52w high', inr(r.high_52w), r.pct_from_52w_high != null ? '−' + Number(r.pct_from_52w_high).toFixed(1) + '%' : '')}
+    ${row('52w low', inr(r.low_52w), r.pct_above_52w_low != null ? '+' + Number(r.pct_above_52w_low).toFixed(1) + '%' : '')}
+    ${row('ADR (20)', adr)}
+    ${row('Avg vol (50d)', avgVol50)}
+    ${row('vs MA50', distMa50)}
+    ${row('ATR ratio', r.atr_ratio ?? '—')}
+    <label class="field-label" for="symbolNotes">Note</label>
+    <textarea class="bip-notes" id="symbolNotes" placeholder="Why this chart? Tight base, volume dry-up…">${esc(getSymbolNote(sym))}</textarea>`;
+  panel.querySelector('#symbolNotes').addEventListener('input', (e) => setSymbolNote(sym, e.target.value));
 }
 
 function exitBrowseMode() {
+  _browseGen++;
   state.browseIndex = -1;
   state.browseList = [];
   closeModal();
 }
 
 function markBrowseDecision(decision) {
-  const sym = state.browseList[state.browseIndex]?.input_symbol;
+  const sym = browseSymOf(state.browseList[state.browseIndex]);
   if (!sym) return;
   // Toggle off if same decision clicked again
   if (state.browseDecisions[sym] === decision) {
@@ -738,23 +806,6 @@ function setSymbolNote(sym, text) {
 
 // Keyboard shortcuts in browse mode
 document.addEventListener('keydown', (e) => {
-  // Drawing delete: works any time the modal is open and a drawing is selected
-  if ((e.key === 'Delete' || e.key === 'Backspace')
-      && _drawState && _drawState.selectedId !== null
-      && !_drawState.editing
-      && !document.getElementById('modal')?.classList.contains('hidden')
-      && e.target.tagName !== 'INPUT'
-      && e.target.tagName !== 'TEXTAREA') {
-    e.preventDefault();
-    const id = _drawState.selectedId;
-    deleteDrawingApi(id).then(() => {
-      _drawState.drawings = _drawState.drawings.filter(d => d.id !== id);
-      _drawState.selectedId = null;
-      renderOverlay();
-    });
-    return;
-  }
-
   if (state.browseIndex < 0) return;
   // Don't intercept if typing in an input/textarea
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
@@ -882,10 +933,10 @@ function updateNotifIcon() {
   const icon = $('notifIcon');
   if (!icon) return;
   if (!notifState.enabled || notifState.permission !== 'granted') {
-    icon.innerHTML = svgIcon('bellOff');
+    icon.innerHTML = svgIcon('bellOff', 16);
     $('notifToggle')?.classList.remove('on');
   } else {
-    icon.innerHTML = svgIcon('bell');
+    icon.innerHTML = svgIcon('bell', 16);
     $('notifToggle')?.classList.add('on');
   }
 }
@@ -982,21 +1033,30 @@ function detectAndAlertStopHits(holdings) {
 // Theme: light / dark, persisted in localStorage
 // ---------------------------------------------------------------------------
 const THEME_KEY = 'vcp_theme_v1';
+
+// Five palettes on one layout. Each is a set of CSS tokens (see styles.css);
+// green/red always mean price & P&L, the accent is the only thing that changes role.
 const THEMES = [
-  { id: 'gemini', label: 'Gemini', dark: false, sw: '#2f6df6' },
-  { id: 'teal',   label: 'Teal',   dark: false, sw: '#0f9b8e' },
-  { id: 'paper',  label: 'Paper',  dark: false, sw: '#b5740f' },
-  { id: 'aurora', label: 'Aurora', dark: true,  sw: '#8b93ff' },
-  { id: 'nebula', label: 'Nebula', dark: true,  sw: 'linear-gradient(135deg,#8b5cf6,#22d3ee)' },
+  { id: 'paper',    label: 'Paper',    dark: false, sw: '#2457c5', bg: '#f6f6f4', note: 'Neutral light' },
+  { id: 'ledger',   label: 'Ledger',   dark: false, sw: '#0f6b63', bg: '#f3efe6', note: 'Warm cream, teal' },
+  { id: 'graphite', label: 'Graphite', dark: true,  sw: '#6ea4ff', bg: '#0f1012', note: 'Neutral dark' },
+  { id: 'midnight', label: 'Midnight', dark: true,  sw: '#4cc3e6', bg: '#0b1220', note: 'Deep navy, cyan' },
+  { id: 'terminal', label: 'Terminal', dark: true,  sw: '#f2a23a', bg: '#0a0a0a', note: 'Black, amber' },
+  // Comfort palettes: softer contrast, no pure white/black — easier for long sessions
+  { id: 'sage',     label: 'Sage',     dark: false, comfort: true, sw: '#3b6784', bg: '#e9ede6', note: 'Soft green-grey, low glare' },
+  { id: 'dusk',     label: 'Dusk',     dark: true,  comfort: true, sw: '#b9a6e4', bg: '#1b1816', note: 'Warm charcoal, low blue light' },
+  { id: 'fjord',    label: 'Fjord',    dark: true,  comfort: true, sw: '#8cb8dc', bg: '#1e2430', note: 'Soft slate blue' },
 ];
 const THEME_IDS = THEMES.map(t => t.id);
 
+// Older stored values (light/dark and the retired gemini/teal/paper/aurora/nebula/amber)
+// map to the nearest current palette.
+const THEME_MIGRATE = { light: 'paper', gemini: 'paper', teal: 'ledger', dark: 'graphite', aurora: 'graphite', nebula: 'midnight', amber: 'terminal' };
 function getTheme() {
   let v = localStorage.getItem(THEME_KEY);
-  if (v === 'light') v = 'gemini';     // migrate the old binary values
-  if (v === 'dark') v = 'aurora';
-  if (v === 'amber') v = 'nebula';     // amber retired -> its slot is Nebula
-  return THEME_IDS.includes(v) ? v : 'gemini';
+  if (v === 'paper') return 'paper';
+  if (THEME_MIGRATE[v]) v = THEME_MIGRATE[v];
+  return THEME_IDS.includes(v) ? v : 'paper';
 }
 function _themeMeta(id) { return THEMES.find(t => t.id === id) || THEMES[0]; }
 
@@ -1004,18 +1064,19 @@ function applyTheme(id) {
   const meta = _themeMeta(id);
   if (document.body) {
     document.body.dataset.theme = meta.id;
-    document.body.classList.toggle('theme-dark', !!meta.dark);
+    document.body.classList.toggle('theme-dark', meta.dark);
   }
   const btn = document.getElementById('themeToggle');
   if (btn) {
-    btn.innerHTML = `<span class="theme-dot" style="background:${meta.sw}"></span>`;
+    btn.innerHTML = `<span class="theme-dot" style="background:${meta.sw};box-shadow:inset 0 0 0 3px ${meta.bg}"></span>`;
     btn.title = `Theme: ${meta.label} — click to change`;
   }
-  // Re-render an open chart with new theme colors (guard against TDZ).
+  // Re-render an open chart with the new theme colours (guard against TDZ).
   try {
     if (typeof _activeResult !== 'undefined' && typeof _activeChart !== 'undefined'
         && _activeResult && _activeChart) {
       renderDetailChart(_activeResult);
+      renderOverlay();
     }
   } catch {}
 }
@@ -1025,31 +1086,39 @@ function setTheme(id) {
 }
 
 function openThemeMenu() {
-  document.querySelectorAll('.theme-menu').forEach(m => m.remove());
+  const existing = document.querySelector('.theme-menu');
+  if (existing) { existing.remove(); return; }
   const btn = document.getElementById('themeToggle');
   if (!btn) return;
   const cur = getTheme();
   const menu = document.createElement('div');
   menu.className = 'theme-menu';
-  menu.innerHTML = `<div class="tm-head">Theme</div>` + THEMES.map(t => `
-    <button class="tm-item ${t.id === cur ? 'on' : ''}" data-theme-id="${t.id}">
-      <span class="tm-dot" style="background:${t.sw}"></span>
-      <span class="tm-label">${t.label}</span>
-      <span class="tm-mode">${t.dark ? 'Dark' : 'Light'}</span>
-      ${t.id === cur ? svgIcon('check', 13) : ''}
-    </button>`).join('');
+  menu.setAttribute('role', 'menu');
+  const item = t => `
+    <button class="tm-item ${t.id === cur ? 'on' : ''}" data-theme-id="${t.id}" role="menuitemradio" aria-checked="${t.id === cur}">
+      <span class="tm-dot" style="background:${t.sw};box-shadow:inset 0 0 0 3px ${t.bg}"></span>
+      <span class="tm-label">${t.label}<i>${t.note}</i></span>
+      ${t.id === cur ? svgIcon('check', 14) : ''}
+    </button>`;
+  menu.innerHTML = `<div class="tm-head">Light</div>${THEMES.filter(t => !t.dark && !t.comfort).map(item).join('')}
+    <div class="tm-head">Dark</div>${THEMES.filter(t => t.dark && !t.comfort).map(item).join('')}
+    <div class="tm-head">Easy on the eyes</div>${THEMES.filter(t => t.comfort).map(item).join('')}`;
   document.body.appendChild(menu);
   const r = btn.getBoundingClientRect();
-  menu.style.top = `${r.bottom + 8}px`;
+  menu.style.top = `${r.bottom + 6}px`;
   menu.style.right = `${Math.max(8, window.innerWidth - r.right)}px`;
   menu.querySelectorAll('.tm-item').forEach(it =>
     it.addEventListener('click', () => { setTheme(it.dataset.themeId); menu.remove(); }));
+  const close = (e) => {
+    if (e.type === 'keydown' && e.key !== 'Escape') return;
+    if (e.type === 'click' && (menu.contains(e.target) || btn.contains(e.target))) return;
+    menu.remove();
+    document.removeEventListener('click', close);
+    document.removeEventListener('keydown', close, true);
+  };
   setTimeout(() => {
-    document.addEventListener('click', function close(e) {
-      if (!menu.contains(e.target) && !btn.contains(e.target)) {
-        menu.remove(); document.removeEventListener('click', close);
-      }
-    });
+    document.addEventListener('click', close);
+    document.addEventListener('keydown', close, true);
   }, 0);
 }
 
@@ -1058,7 +1127,7 @@ function openThemeMenu() {
   const meta = _themeMeta(getTheme());
   const set = () => {
     document.body.dataset.theme = meta.id;
-    document.body.classList.toggle('theme-dark', !!meta.dark);
+    document.body.classList.toggle('theme-dark', meta.dark);
   };
   if (document.body) set();
   else document.addEventListener('DOMContentLoaded', set, { once: true });
@@ -1216,7 +1285,7 @@ function sortAndRerender() {
   } else if (active.isCustom) {
     // Custom section: just one grid showing everything assigned
     if (active.items.length === 0) {
-      tabBody.innerHTML = `<p class="empty-tab">No stocks in this section yet. Drag any card here, or use the "Move to…" button on a card to assign it.</p>`;
+      tabBody.innerHTML = `<p class="empty-tab">No stocks in this section yet. Use the ⋯ button on a card, or the Section menu while browsing, to add one.</p>`;
     } else {
       const csyms = active.items.map(r => r.input_symbol || r.ticker).join(',');
       tabBody.innerHTML = `
@@ -1239,7 +1308,7 @@ function sortAndRerender() {
     const other = active.items.filter(r => r.category !== 'breakout' && r.category !== 'watchlist').sort((a, b) => (b.score || 0) - (a.score || 0));
 
     if (active.items.length === 0) {
-      tabBody.innerHTML = `<p class="empty-tab">No passing setups in this category yet. Run a screen.</p>`;
+      tabBody.innerHTML = `<p class="empty-tab">${state.results.length ? 'No passing setups in this category.' : (state.symbols && state.symbols.length ? 'Run the screener to sort this upload into VCP and bull-flag setups, or Browse charts to flip through every symbol.' : 'Drop a Chartink CSV to scan, or pick one of your sections above.')}</p>`;
     } else {
       const bsyms = breakouts.map(r => r.input_symbol || r.ticker).join(',');
       const wsyms = watch.map(r => r.input_symbol || r.ticker).join(',');
@@ -1659,6 +1728,33 @@ function updateRejectedCount() {
   $('rejectedSection').classList.toggle('hidden', rj === 0);
 }
 
+// Tiny price sparkline for a card: last ~60 closes, pivot as a dashed line,
+// base low/high band. Pure SVG, coloured by the theme via currentColor/classes.
+function cardSparkline(r) {
+  const closes = (r.chart?.close || []).filter(v => v != null);
+  if (closes.length < 10) return '';
+  const pts = closes.slice(-60);
+  const w = 220, h = 40, pad = 3;
+  const lo0 = Math.min(...pts), hi0 = Math.max(...pts);
+  const pivot = Number(r.pivot) || null;
+  const lo = Math.min(lo0, pivot && pivot < lo0 * 0.85 ? lo0 : (pivot ?? lo0));
+  const hi = Math.max(hi0, pivot && pivot > hi0 * 1.15 ? hi0 : (pivot ?? hi0));
+  const span = (hi - lo) || 1;
+  const X = i => pad + i * (w - 2 * pad) / (pts.length - 1);
+  const Y = v => pad + (1 - (v - lo) / span) * (h - 2 * pad);
+  const line = pts.map((v, i) => `${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join(' ');
+  const area = `M${X(0).toFixed(1)},${h} L${line.replace(/ /g, ' L')} L${X(pts.length - 1).toFixed(1)},${h} Z`;
+  const up = pts[pts.length - 1] >= pts[0];
+  const pivY = pivot && pivot >= lo && pivot <= hi ? Y(pivot).toFixed(1) : null;
+  const last = pts[pts.length - 1];
+  return `<svg class="card-spark ${up ? 'up' : 'down'}" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true">
+    <path class="cs-area" d="${area}"/>
+    ${pivY ? `<line class="cs-pivot" x1="0" x2="${w}" y1="${pivY}" y2="${pivY}"/>` : ''}
+    <polyline class="cs-line" points="${line}"/>
+    <circle class="cs-dot" cx="${X(pts.length - 1).toFixed(1)}" cy="${Y(last).toFixed(1)}" r="2.2"/>
+  </svg>`;
+}
+
 function buildCardEl(r) {
   const card = document.createElement('div');
   const isErr = !!r.error;
@@ -1686,6 +1782,7 @@ function buildCardEl(r) {
         ${sectionBadge}
       </div>
     </div>
+    ${cardSparkline(r)}
     <div class="card-row">
       <span>CMP <b>${r.current_price ? '₹' + r.current_price.toLocaleString('en-IN') : '—'}</b></span>
       <span>${fromPivotText(r)}</span>
@@ -1801,6 +1898,33 @@ async function renderCustomCards(items, grid, section) {
 // get_ltp call and poll every RED_LIVE_POLL_MS (well under the cap), only while
 // the RED grid is on-screen and the page is visible. A single timer is reused,
 // so tabs can never stack overlapping pollers.
+// ---------------------------------------------------------------------------
+// NSE market hours (IST). Live polling only runs while the market is open;
+// outside hours we fetch the last traded price once and then stay quiet.
+// Holiday list: equity segment, from NSE's 2026 calendar — add next year's
+// dates when NSE publishes them (unknown years fall back to weekends only).
+// ---------------------------------------------------------------------------
+const NSE_HOLIDAYS = new Set([
+  '2026-01-15', '2026-01-26', '2026-03-03', '2026-03-26', '2026-03-31', '2026-04-03',
+  '2026-04-14', '2026-05-01', '2026-05-28', '2026-06-26', '2026-09-14', '2026-10-02',
+  '2026-10-20', '2026-11-10', '2026-11-24', '2026-12-25',
+]);
+const MARKET_OPEN_MIN = 9 * 60 + 15;     // 09:15 IST
+const MARKET_CLOSE_MIN = 15 * 60 + 32;   // 15:30 IST + 2 min grace for the closing print
+
+function marketState(ts = Date.now()) {
+  const t = new Date(ts + 5.5 * 3600 * 1000);              // shift to IST, read with getUTC*
+  const ymd = t.toISOString().slice(0, 10);
+  const dow = t.getUTCDay();
+  const mins = t.getUTCHours() * 60 + t.getUTCMinutes();
+  if (dow === 0 || dow === 6) return { open: false, reason: 'Weekend' };
+  if (NSE_HOLIDAYS.has(ymd)) return { open: false, reason: 'Market holiday' };
+  if (mins < MARKET_OPEN_MIN) return { open: false, reason: 'Pre-market' };
+  if (mins >= MARKET_CLOSE_MIN) return { open: false, reason: 'Market closed' };
+  return { open: true, reason: '' };
+}
+function isMarketOpen() { return marketState().open; }
+
 const RED_LIVE_POLL_MS = 3000;
 let _redLiveTimer = null;
 
@@ -1810,12 +1934,15 @@ function stopRedLivePolling() {
 
 function startRedLivePolling(items, grid) {
   stopRedLivePolling();
-  applyLiveKitePrices(items, grid);            // immediate first paint
+  applyLiveKitePrices(items, grid);            // immediate first paint (last price, even when closed)
   _redLiveTimer = setInterval(() => {
     // Self-terminate once the grid leaves the DOM (user switched tab / re-render).
     if (!document.body.contains(grid)) { stopRedLivePolling(); return; }
     // Don't spend quota while the page is hidden (background tab / minimised).
     if (document.hidden) return;
+    // Market closed: no requests. The timer keeps ticking (no network) so
+    // polling resumes by itself at 09:15 if the page is left open.
+    if (!isMarketOpen()) return;
     applyLiveKitePrices(items, grid);
   }, RED_LIVE_POLL_MS);
 }
@@ -1884,7 +2011,9 @@ async function applyLiveKitePrices(items, grid) {
     }
     n++;
   }
-  setStatus(`● Live · ${n} price${n === 1 ? '' : 's'} · ${now()}`, 'ok');
+  const ms = marketState();
+  if (ms.open) setStatus(`● Live · ${n} price${n === 1 ? '' : 's'} · ${now()}`, 'ok');
+  else setStatus(`${ms.reason} · last traded price`, 'muted');
 }
 
 function fromPivotText(r) {
@@ -1905,7 +2034,17 @@ $('modal').addEventListener('click', (e) => {
   if (e.target.id === 'modal') closeModal();
 });
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') closeModal();
+  if (e.key === 'Escape') {
+    if (e.defaultPrevented) return;          // consumed by a dialog or the drawing layer
+    closeModal(); return;
+  }
+  if ((e.key === 'f' || e.key === 'F') && !e.ctrlKey && !e.metaKey && !e.altKey
+      && !$('modal').classList.contains('hidden')
+      && !/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)
+      && document.getElementById('detailChart')) {
+    e.preventDefault();
+    toggleChartFocus();
+  }
 });
 
 function closeModal() {
@@ -1913,10 +2052,7 @@ function closeModal() {
   $('modal').classList.remove('browse-mode');
   $('modal').classList.remove('chart-fullscreen');
   stopChartLivePolling();
-  _drawState.symbol = null;
-  _drawState.drawings = [];
-  _drawState.drafting = null;
-  _drawState.tool = 'cursor';
+  resetDrawState();
   // Exit browse mode if we're in it
   state.browseIndex = -1;
   state.browseList = [];
@@ -1944,10 +2080,10 @@ function startChartLivePolling(r) {
   const sym = r.input_symbol || (r.ticker || '').replace(/\.(NS|BO)$/, '');
   if (!sym) return;
   _chartLiveSymbol = sym;
-  applyChartLivePrice(sym);
+  applyChartLivePrice(sym);                    // one fetch for the latest / closing price
   _chartLiveTimer = setInterval(() => {
     if ($('modal').classList.contains('hidden') || _chartLiveSymbol !== sym) { stopChartLivePolling(); return; }
-    if (document.hidden) return;
+    if (document.hidden || !isMarketOpen()) return;
     applyChartLivePrice(sym);
   }, CHART_LIVE_POLL_MS);
 }
@@ -1995,7 +2131,7 @@ async function applyChartLivePrice(sym) {
     last.close = price;
     try { _activeSeries.update({ time: last.time, open: last.open, high: last.high, low: last.low, close: price }); } catch (e) {}
   }
-  setChartLiveBadge(true);
+  setChartLiveBadge(isMarketOpen() ? 'live' : 'closed');
 }
 
 // Insert/update a small "L ₹x" / "H ₹x" chip in the chart header, ordered
@@ -2014,19 +2150,21 @@ function setHeaderStat(cls, label, val, head) {
   el.innerHTML = `<span class="mh-stat-l">${label}</span> ₹${Number(val).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
-function setChartLiveBadge(on) {
+// state: 'live' | 'closed' | false
+function setChartLiveBadge(state) {
   const head = document.querySelector('.modal-head');
   if (!head) return;
   let badge = head.querySelector('.mh-live');
-  if (on && !badge) {
+  if (!state) { badge?.remove(); return; }
+  if (!badge) {
     badge = document.createElement('span');
-    badge.className = 'mh-live';
-    badge.textContent = '● LIVE';
     const anchor = head.querySelector('.mh-high') || head.querySelector('.mh-low') || head.querySelector('.mh-chg');
     if (anchor) anchor.insertAdjacentElement('afterend', badge); else head.appendChild(badge);
-  } else if (!on && badge) {
-    badge.remove();
   }
+  const closed = state === 'closed';
+  badge.className = 'mh-live' + (closed ? ' closed' : '');
+  badge.textContent = closed ? 'CLOSED' : '● LIVE';
+  badge.title = closed ? `${marketState().reason} — showing the last traded price; live updates resume at 09:15 IST` : 'Live price via Kite, updating every few seconds';
 }
 
 function fmtRs(v) {
@@ -2041,158 +2179,128 @@ function parseNum(v) {
 }
 
 function openModal(r) {
+  const sym = browseSymOf(r) || r.ticker;
   if (r.error) {
     const nd = r.no_data;
     $('modalContent').innerHTML = `
-      <div class="modal-head"><div>
-        <div class="modal-ticker">${r.input_symbol}</div>
-        <div class="modal-pattern" style="color:var(--neg)">${nd ? 'No data' : 'Error'}</div>
-      </div></div>
-      <div class="modal-section">
-        <p>${nd ? `No chart data for <b>${esc(r.input_symbol)}</b> on NSE or BSE — likely renamed or delisted. Moved to the “No data” section.` : esc(r.error)}</p>
+      <div class="ws">
+        <div class="ws-main">
+          <div class="modal-head ws-head"><span class="mh-tk">${esc(sym)}</span><span class="mh-badge neg">${nd ? 'No data' : 'Error'}</span></div>
+          <div class="ws-error">
+            <p>${nd ? `No chart data for <b>${esc(sym)}</b> on NSE or BSE — likely renamed or delisted. Moved to the “No data” section.` : esc(r.error)}</p>
+          </div>
+        </div>
+        <aside class="ws-side"><section class="ws-sec hidden" id="wsDecision"></section></aside>
       </div>`;
     $('modal').classList.remove('hidden');
     return;
   }
 
-  const isBreakout = r.category === 'breakout';
-
-  // Compute day change from chart data
+  // Day change from chart data
   const chartCloses = r.chart?.close || [];
   const prevClose = chartCloses.length >= 2 ? chartCloses[chartCloses.length - 2] : r.current_price;
   const dayChange = r.current_price - prevClose;
   const dayChangePct = prevClose ? (dayChange / prevClose) * 100 : 0;
   const changeCls = dayChange >= 0 ? 'pos' : 'neg';
   const changeSign = dayChange >= 0 ? '+' : '';
+  const fromPivot = r.pct_from_pivot == null ? null
+    : (r.pct_from_pivot < 0 ? { t: `+${(-r.pct_from_pivot).toFixed(2)}% past`, c: 'pos' }
+                            : { t: `${r.pct_from_pivot.toFixed(2)}% below`, c: r.pct_from_pivot <= 3 ? 'near' : '' });
+  const kv = (l, v, cls = '', sub = '') => `<div class="ts"><span class="ts-l">${l}</span><span class="ts-v ${cls}">${v}${sub ? ` <i>${sub}</i>` : ''}</span></div>`;
 
   $('modalContent').innerHTML = `
-    <div class="modal-head modal-head-compact">
-      <span class="mh-tk">${r.input_symbol || r.ticker}</span>
-      <span class="mh-px">₹${r.current_price?.toLocaleString('en-IN', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</span>
-      <span class="mh-chg ${changeCls}">${changeSign}${dayChange.toFixed(2)} (${changeSign}${dayChangePct.toFixed(2)}%)</span>
-      ${r.pattern ? `<span class="mh-badge">${esc(r.pattern)}${r.score != null ? ` · ${r.score}` : ''}</span>` : ''}
-    </div>
-
-    <div class="trade-strip">
-      <div class="ts"><span class="ts-l">Entry</span><span class="ts-v">${fmtRs(r.entry)}</span></div>
-      <div class="ts"><span class="ts-l">Stop</span><span class="ts-v neg">${fmtRs(r.stop)}${r.risk_pct != null ? ` <i>−${r.risk_pct}%</i>` : ''}</span></div>
-      <div class="ts"><span class="ts-l">Target</span><span class="ts-v pos">${fmtRs(r.target)}</span></div>
-      <div class="ts"><span class="ts-l">R : R</span><span class="ts-v">${r.r_multiple_potential != null ? r.r_multiple_potential + 'R' : '—'}</span></div>
-      <div class="ts"><span class="ts-l">Pivot</span><span class="ts-v">${fmtRs(r.pivot)}</span></div>
-      <div class="ts"><span class="ts-l">From pivot</span><span class="ts-v">${r.pct_from_pivot == null ? '—' : (r.pct_from_pivot < 0 ? `+${(-r.pct_from_pivot).toFixed(2)}% past` : `${r.pct_from_pivot.toFixed(2)}% below`)}</span></div>
-      <div class="ts"><span class="ts-l">ATR ratio</span><span class="ts-v">${r.atr_ratio ?? '—'}</span></div>
-      <div class="ts"><span class="ts-l">52-wk</span><span class="ts-v">${(r.low_52w != null && r.high_52w != null) ? `${Number(r.low_52w).toLocaleString('en-IN')} – ${Number(r.high_52w).toLocaleString('en-IN')}` : '—'}</span></div>
-    </div>
-
-    <div class="chart-toolbar">
-      <div class="chart-toolbar-right">
-        <div class="tb-group" title="Timeframe">
-          <button class="tb-btn" data-tf="1h">1H</button>
-          <button class="tb-btn active" data-tf="1d">1D</button>
-          <button class="tb-btn" data-tf="1wk">1W</button>
+    <div class="ws">
+      <div class="ws-main">
+        <div class="modal-head modal-head-compact ws-head">
+          <span class="mh-tk">${esc(sym)}</span>
+          <span class="mh-px">₹${r.current_price?.toLocaleString('en-IN', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</span>
+          <span class="mh-chg ${changeCls}">${changeSign}${dayChange.toFixed(2)} (${changeSign}${dayChangePct.toFixed(2)}%)</span>
+          ${fromPivot ? `<span class="mh-pivot ${fromPivot.c}">${fromPivot.t} pivot</span>` : ''}
+          ${r.pattern ? `<span class="mh-badge">${esc(r.pattern)}${r.score != null ? ` · ${r.score}` : ''}</span>` : ''}
+          <span class="ws-head-spacer"></span>
+          <span class="ws-head-actions" id="wsHeadActions">
+            <button class="icon-btn" id="chartFullscreenBtn" title="Focus chart — hide side panels (F)" aria-label="Focus chart"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3M16 21h3a2 2 0 0 0 2-2v-3"/></svg></button>
+          </span>
         </div>
-        <div class="tb-sep"></div>
-        <div class="tb-group" title="Moving averages">
-          <button class="tb-btn ma-toggle active" data-ma="ma10" style="--dot:#2563eb">MA10</button>
-          <button class="tb-btn ma-toggle active" data-ma="ma20" style="--dot:#d97706">MA20</button>
-          <button class="tb-btn ma-toggle active" data-ma="ma50" style="--dot:#8b5cf6">MA50</button>
+
+        <div class="chart-toolbar">
+          <div class="tb-group" role="group" aria-label="Timeframe">
+            <button class="tb-btn" data-tf="1h">1H</button>
+            <button class="tb-btn active" data-tf="1d">1D</button>
+            <button class="tb-btn" data-tf="1wk">1W</button>
+          </div>
+          <div class="tb-sep"></div>
+          <div class="tb-group" role="group" aria-label="Range">
+            <button class="tb-btn tb-range-btn" data-range="30">1M</button>
+            <button class="tb-btn tb-range-btn" data-range="60">2M</button>
+            <button class="tb-btn tb-range-btn" data-range="90">3M</button>
+            <button class="tb-btn tb-range-btn active" data-range="120">4M</button>
+            <button class="tb-btn tb-range-btn" data-range="180">6M</button>
+            <button class="tb-btn tb-range-btn" data-range="all">All</button>
+          </div>
+          <div class="tb-sep"></div>
+          <div class="tb-group" role="group" aria-label="Overlays">
+            <button class="tb-btn ma-toggle active" data-ma="ma10" style="--dot:${MA_COLORS.ma10}">MA10</button>
+            <button class="tb-btn ma-toggle active" data-ma="ma20" style="--dot:${MA_COLORS.ma20}">MA20</button>
+            <button class="tb-btn ma-toggle active" data-ma="ma50" style="--dot:${MA_COLORS.ma50}">MA50</button>
+            <button class="tb-btn vcp-toggle active" data-vcp="on" title="VCP structure: base range and pullback %">VCP</button>
+          </div>
         </div>
-        <div class="tb-sep"></div>
-        <div class="tb-group" title="VCP structure">
-          <button class="tb-btn vcp-toggle active" data-vcp="on">${svgIcon('activity', 14)} VCP</button>
+
+        <div class="chart-area">
+          <div class="draw-rail" id="drawRail" role="toolbar" aria-label="Drawing tools" aria-orientation="vertical">${drawRailHTML()}</div>
+          <div class="modal-chart" id="detailChart">
+            <svg class="draw-overlay" id="drawOverlay" xmlns="http://www.w3.org/2000/svg"></svg>
+            <div class="chart-legend">
+              <span class="legend-item"><span class="legend-line pivot"></span>Pivot ${r.pivot != null ? Number(r.pivot).toFixed(2) : '—'}</span>
+              <span class="legend-item"><span class="legend-arrow down"></span>Swing high</span>
+              <span class="legend-item"><span class="legend-arrow up"></span>Swing low</span>
+              <span class="legend-item"><span class="legend-arrow up amber"></span>Pullback %</span>
+            </div>
+            <div class="draw-hud hidden" id="drawHud"></div>
+          </div>
         </div>
-        <div class="tb-sep"></div>
-        <div class="tb-group" title="Range">
-          <button class="tb-btn tb-range-btn" data-range="30">1M</button>
-          <button class="tb-btn tb-range-btn" data-range="60">2M</button>
-          <button class="tb-btn tb-range-btn" data-range="90">3M</button>
-          <button class="tb-btn tb-range-btn active" data-range="120">4M</button>
-          <button class="tb-btn tb-range-btn" data-range="180">6M</button>
-          <button class="tb-btn tb-range-btn" data-range="all">All</button>
-        </div>
-        <div class="tb-sep"></div>
-        <div class="tb-group" title="Fullscreen chart">
-          <button class="tb-btn" id="chartFullscreenBtn" title="Toggle fullscreen chart" aria-label="Toggle fullscreen chart"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3M16 21h3a2 2 0 0 0 2-2v-3"/></svg></button>
-        </div>
+        <div class="ws-keys hidden" id="wsKeys"></div>
       </div>
+
+      <aside class="ws-side">
+        <section class="ws-sec hidden" id="wsDecision"></section>
+
+        <section class="ws-sec">
+          <div class="ws-sec-head"><h4>Levels</h4></div>
+          <div class="trade-strip">
+            ${kv('Pivot', fmtRs(r.pivot))}
+            ${kv('From pivot', fromPivot ? fromPivot.t : '—', fromPivot ? fromPivot.c : '')}
+            ${kv('Entry', fmtRs(r.entry))}
+            ${kv('Stop', fmtRs(r.stop), 'neg', r.risk_pct != null ? `−${r.risk_pct}%` : '')}
+            ${kv('Target', fmtRs(r.target), 'pos')}
+            ${kv('R : R', r.r_multiple_potential != null ? r.r_multiple_potential + 'R' : '—')}
+          </div>
+        </section>
+
+        <section class="ws-sec" id="wsInfo"></section>
+
+        <section class="ws-sec">
+          <div class="indicators-panel" id="indicatorsPanel"></div>
+        </section>
+
+        <details class="ws-sec modal-details">
+          <summary>Base structure</summary>
+          <div class="trade-strip">
+            ${kv('Base age', r.base_weeks != null ? r.base_weeks + 'w' : '—')}
+            ${kv('Contractions', r.pullbacks ? r.pullbacks.map(p => p + '%').join(' → ') : '—')}
+            ${kv('Base range', r.base_range_pct != null ? r.base_range_pct + '%' : '—')}
+            ${kv('From 52w high', r.pct_from_52w_high != null ? r.pct_from_52w_high + '%' : '—')}
+            ${kv('ATR 10 / 50', r.atr_ratio ?? '—')}
+          </div>
+          ${r.notes ? `<p class="ws-notes">${esc(r.notes)}</p>` : ''}
+        </details>
+      </aside>
     </div>
-
-    <div class="draw-toolbar">
-      <div class="draw-tools" role="group" aria-label="Drawing tools">
-        <button class="draw-btn active" data-tool="cursor" title="Cursor (no draw)">↖</button>
-        <button class="draw-btn" data-tool="rect" title="Rectangle">▭</button>
-        <button class="draw-btn" data-tool="hline" title="Horizontal line">─</button>
-        <button class="draw-btn" data-tool="trend" title="Trend line">╲</button>
-        <button class="draw-btn" data-tool="arrow" title="Arrow">↗</button>
-        <button class="draw-btn" data-tool="fib" title="Fibonacci retracement (drag from swing high to swing low)">𝝓</button>
-      </div>
-      <div class="draw-color">
-        <label>Color</label>
-        <input type="color" id="drawColor" value="#2563eb">
-      </div>
-      <div class="draw-label">
-        <label>Label</label>
-        <input type="text" id="drawLabel" placeholder="Demand zone…" maxlength="40">
-      </div>
-      <div style="flex:1"></div>
-      <button class="draw-action" id="clearDrawingsBtn" title="Clear all drawings on this symbol">Clear all</button>
-    </div>
-
-    <div class="modal-chart" id="detailChart">
-      <svg class="draw-overlay" id="drawOverlay" xmlns="http://www.w3.org/2000/svg"></svg>
-      <div class="chart-legend">
-        <div class="legend-item"><span class="legend-line pivot"></span>Pivot ₹${r.pivot?.toFixed(2) ?? '—'}</div>
-        <div class="legend-sep"></div>
-        <div class="legend-item"><span class="legend-arrow down"></span>Swing high</div>
-        <div class="legend-item"><span class="legend-arrow up"></span>Swing low</div>
-        <div class="legend-item"><span class="legend-arrow up amber"></span>Base pullback %</div>
-      </div>
-      <div class="chart-hint">scroll · zoom &nbsp;·&nbsp; drag · pan &nbsp;·&nbsp; pick a tool above to annotate</div>
-    </div>
-
-    <details class="modal-details">
-      <summary>Structure &amp; indicators</summary>
-    <div class="indicators-panel" id="indicatorsPanel"></div>
-
-    <div class="modal-grid">
-      <div class="modal-metric">
-        <span class="metric-label">CMP</span>
-        <span class="metric-val">₹${r.current_price?.toLocaleString('en-IN') ?? '—'}</span>
-      </div>
-      <div class="modal-metric">
-        <span class="metric-label">Pivot</span>
-        <span class="metric-val">₹${r.pivot != null ? Number(r.pivot).toLocaleString('en-IN', {maximumFractionDigits: 2}) : '—'}</span>
-      </div>
-      <div class="modal-metric">
-        <span class="metric-label">From pivot</span>
-        <span class="metric-val">${r.pct_from_pivot == null ? '—' : (r.pct_from_pivot < 0 ? `<span style="color:var(--pos)">+${(-r.pct_from_pivot).toFixed(2)}% past</span>` : `${r.pct_from_pivot.toFixed(2)}% below`)}</span>
-      </div>
-      <div class="modal-metric">
-        <span class="metric-label">Base age</span>
-        <span class="metric-val">${r.base_weeks != null ? r.base_weeks + 'w' : '—'}</span>
-      </div>
-      <div class="modal-metric">
-        <span class="metric-label">Contractions</span>
-        <span class="metric-val" style="font-size:0.95rem">${r.pullbacks ? r.pullbacks.map(p => p + '%').join(' → ') : '—'}</span>
-      </div>
-      <div class="modal-metric">
-        <span class="metric-label">Base range</span>
-        <span class="metric-val">${r.base_range_pct ?? '—'}%</span>
-      </div>
-      <div class="modal-metric">
-        <span class="metric-label">From 52wH</span>
-        <span class="metric-val">${r.pct_from_52w_high ?? '—'}%</span>
-      </div>
-      <div class="modal-metric">
-        <span class="metric-label">ATR(10)/(50)</span>
-        <span class="metric-val">${r.atr_ratio ?? '—'}</span>
-      </div>
-    </div>
-
-    ${r.notes ? `<div class="modal-section"><h3>Notes</h3><p>${esc(r.notes)}</p></div>` : ''}
-    </details>
   `;
   $('modal').classList.remove('hidden');
+  $('modal').classList.toggle('chart-fullscreen', !!state.chartFocus);
+  buildInfoPanel(r);
 
   // Wire up range buttons
   document.querySelectorAll('.tb-range-btn').forEach(b => {
@@ -2230,15 +2338,11 @@ function openModal(r) {
     });
   }
 
-  // Fullscreen toggle for the chart modal
+  // Focus mode: hide the side panels so the chart gets the full width
   const fsBtn = document.getElementById('chartFullscreenBtn');
   if (fsBtn) {
-    fsBtn.addEventListener('click', () => {
-      const on = $('modal').classList.toggle('chart-fullscreen');
-      fsBtn.classList.toggle('active', on);
-      // Let the chart adopt the new container size, then repaint the drawings overlay.
-      requestAnimationFrame(() => { try { window.dispatchEvent(new Event('resize')); renderOverlay(); } catch (e) {} });
-    });
+    fsBtn.classList.toggle('active', !!state.chartFocus);
+    fsBtn.addEventListener('click', toggleChartFocus);
   }
 
   requestAnimationFrame(() => {
@@ -2249,6 +2353,13 @@ function openModal(r) {
     renderIndicators(r);
     startChartLivePolling(r);
   });
+}
+
+function toggleChartFocus() {
+  state.chartFocus = !state.chartFocus;
+  $('modal').classList.toggle('chart-fullscreen', state.chartFocus);
+  document.getElementById('chartFullscreenBtn')?.classList.toggle('active', state.chartFocus);
+  requestAnimationFrame(() => { try { window.dispatchEvent(new Event('resize')); renderOverlay(); } catch (e) {} });
 }
 
 // ---------------------------------------------------------------------------
@@ -2447,7 +2558,39 @@ let _activeData = null;
 let _activeResult = null;   // the original result object (for overlays)
 let _maSeries = {};         // { ma10, ma20, ma50 }
 
-const MA_COLORS = { ma10: '#2563eb', ma20: '#d97706', ma50: '#8b5cf6' };
+const MA_COLORS = { ma10: '#4f8ff7', ma20: '#d39a2c', ma50: '#9a7cf0' };
+let _volSeries = null;
+
+// Chart palette comes from the CSS tokens so the canvas always matches the theme.
+function chartColors() {
+  const cs = getComputedStyle(document.body);
+  const v = (name, fb) => (cs.getPropertyValue(name).trim() || fb);
+  return {
+    bg: v('--chart-bg', '#ffffff'),
+    text: v('--text-dim', '#55554f'),
+    grid: v('--chart-grid', 'rgba(0,0,0,0.05)'),
+    border: v('--border', 'rgba(0,0,0,0.1)'),
+    crosshair: v('--text-faint', '#888'),
+    label: v('--chart-label', '#333'),
+    pos: v('--pos', '#11834f'),
+    neg: v('--neg', '#c93636'),
+    accent: v('--accent', '#2457c5'),
+    amber: v('--amber', '#b7791f'),
+    volUp: v('--chart-vol-up', 'rgba(17,131,79,0.3)'),
+    volDn: v('--chart-vol-dn', 'rgba(201,54,54,0.3)'),
+  };
+}
+
+function buildVolumeData(times, opens, closes, volumes, C) {
+  if (!volumes || !times) return [];
+  const out = [];
+  for (let i = 0; i < times.length; i++) {
+    const v = volumes[i];
+    if (v == null) continue;
+    out.push({ time: times[i], value: v, color: (closes?.[i] ?? 0) >= (opens?.[i] ?? 0) ? C.volUp : C.volDn });
+  }
+  return out;
+}
 
 function renderDetailChart(r) {
   const el = $('detailChart');
@@ -2462,38 +2605,33 @@ function renderDetailChart(r) {
     try { _activeChart.remove(); } catch {}
     _activeChart = null;
     _maSeries = {};
+    _volSeries = null;
   }
 
-  const isDark = document.body.classList.contains('theme-dark');
-  const chartBg = isDark ? '#161b22' : '#ffffff';
-  const chartText = isDark ? '#8b949e' : '#52524e';
-  const gridColor = isDark ? 'rgba(240, 246, 252, 0.05)' : 'rgba(15, 15, 12, 0.05)';
-  const borderColor = isDark ? 'rgba(240, 246, 252, 0.15)' : 'rgba(15, 15, 12, 0.12)';
-  const crosshairColor = isDark ? 'rgba(88, 166, 255, 0.5)' : 'rgba(37, 99, 235, 0.4)';
-
+  const C = chartColors();
   const chart = LightweightCharts.createChart(el, {
     layout: {
-      background: { color: chartBg },
-      textColor: chartText,
-      fontFamily: 'JetBrains Mono, monospace',
+      background: { color: C.bg },
+      textColor: C.text,
+      fontFamily: "'IBM Plex Mono', ui-monospace, monospace",
       fontSize: 11,
     },
     grid: {
-      vertLines: { color: gridColor },
-      horzLines: { color: gridColor },
+      vertLines: { color: C.grid },
+      horzLines: { color: C.grid },
     },
     timeScale: {
-      borderColor: borderColor,
+      borderColor: C.border,
       timeVisible: false,
       rightOffset: 5,
       barSpacing: 6,
       minBarSpacing: 2,
     },
-    rightPriceScale: { borderColor: borderColor },
+    rightPriceScale: { borderColor: C.border, scaleMargins: { top: 0.08, bottom: 0.22 } },
     crosshair: {
       mode: 1,
-      vertLine: { color: crosshairColor, width: 1, style: 2 },
-      horzLine: { color: crosshairColor, width: 1, style: 2 },
+      vertLine: { color: C.crosshair, width: 1, style: 2, labelBackgroundColor: C.label },
+      horzLine: { color: C.crosshair, width: 1, style: 2, labelBackgroundColor: C.label },
     },
     handleScroll: {
       mouseWheel: true,
@@ -2511,13 +2649,22 @@ function renderDetailChart(r) {
     autoSize: true,
   });
 
-  const upColor = isDark ? '#3fb950' : '#089981';
-  const downColor = isDark ? '#f85149' : '#e13d3d';
+  // Volume histogram in the bottom ~18% of the pane
+  const vol = chart.addHistogramSeries({
+    priceFormat: { type: 'volume' },
+    priceScaleId: 'vol',
+    lastValueVisible: false,
+    priceLineVisible: false,
+  });
+  chart.priceScale('vol').applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+  _volSeries = vol;
+  vol.setData(buildVolumeData(r.chart.dates, r.chart.open, r.chart.close, r.chart.volume, C));
+
   const candle = chart.addCandlestickSeries({
-    upColor: upColor,
-    downColor: downColor,
-    wickUpColor: upColor,
-    wickDownColor: downColor,
+    upColor: C.pos,
+    downColor: C.neg,
+    wickUpColor: C.pos,
+    wickDownColor: C.neg,
     borderVisible: false,
     priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
   });
@@ -2587,6 +2734,7 @@ function drawVcpStructure(r) {
   _vcpLines = [];
 
   if (!_activeSeries || !r.swings || !r.base_start_date) return;
+  const C = chartColors();
 
   // Find base boundaries from the swings that fall inside the base
   const baseSwings = r.swings.filter(s => s.date >= r.base_start_date);
@@ -2628,7 +2776,7 @@ function drawVcpStructure(r) {
         annotated.push({
           time: s.date,
           position: 'belowBar',
-          color: '#d97706',
+          color: C.amber,
           shape: 'arrowUp',
           size: 1,
           text: `−${pullback.toFixed(1)}%`,
@@ -2637,18 +2785,18 @@ function drawVcpStructure(r) {
         // Still mark it, but without text
         annotated.push({
           time: s.date, position: 'belowBar',
-          color: '#e13d3d', shape: 'arrowUp', size: 0.7,
+          color: C.neg, shape: 'arrowUp', size: 0.7,
         });
       }
     } else if (s.type === 'H') {
       annotated.push({
         time: s.date, position: 'aboveBar',
-        color: '#089981', shape: 'arrowDown', size: 0.7,
+        color: C.pos, shape: 'arrowDown', size: 0.7,
       });
     } else {
       annotated.push({
         time: s.date, position: 'belowBar',
-        color: '#e13d3d', shape: 'arrowUp', size: 0.7,
+        color: C.neg, shape: 'arrowUp', size: 0.7,
       });
     }
   }
@@ -2657,7 +2805,7 @@ function drawVcpStructure(r) {
   const preBase = r.swings.filter(s => s.date < r.base_start_date).map(s => ({
     time: s.date,
     position: s.type === 'H' ? 'aboveBar' : 'belowBar',
-    color: s.type === 'H' ? '#089981' : '#e13d3d',
+    color: s.type === 'H' ? C.pos : C.neg,
     shape: s.type === 'H' ? 'arrowDown' : 'arrowUp',
     size: 0.6,
   }));
@@ -2680,7 +2828,7 @@ function toggleVcpOverlay(on) {
 function addOverlays(series, r) {
   if (r.pivot) {
     series.createPriceLine({
-      price: r.pivot, color: 'rgba(15, 15, 12, 0.45)', lineWidth: 1, lineStyle: 3,
+      price: r.pivot, color: chartColors().accent, lineWidth: 1, lineStyle: 2,
       axisLabelVisible: true, title: 'Pivot',
     });
   }
@@ -2688,10 +2836,11 @@ function addOverlays(series, r) {
 
 function applySwingMarkers(series, r) {
   if (!r.swings || !r.swings.length) return;
+  const C = chartColors();
   const markers = r.swings.map(s => ({
     time: s.date,
     position: s.type === 'H' ? 'aboveBar' : 'belowBar',
-    color: s.type === 'H' ? '#089981' : '#e13d3d',
+    color: s.type === 'H' ? C.pos : C.neg,
     shape: s.type === 'H' ? 'arrowDown' : 'arrowUp',
     size: 0.7,
   }));
@@ -2770,6 +2919,7 @@ async function switchTimeframe(r, interval) {
     }));
     _activeSeries.setData(candleData);
     _activeData = candleData;
+    if (_volSeries) _volSeries.setData(buildVolumeData(data.times, data.open, data.close, data.volume, chartColors()));
 
     // Update MAs
     ['ma10', 'ma20', 'ma50'].forEach(k => {
@@ -2779,10 +2929,11 @@ async function switchTimeframe(r, interval) {
     });
 
     // Swing markers only meaningful on daily (scoring was done on daily); clear on other tfs
+    const C = chartColors();
     _activeSeries.setMarkers(interval === '1d' && r.swings ? r.swings.map(s => ({
       time: s.date,
       position: s.type === 'H' ? 'aboveBar' : 'belowBar',
-      color: s.type === 'H' ? '#089981' : '#e13d3d',
+      color: s.type === 'H' ? C.pos : C.neg,
       shape: s.type === 'H' ? 'arrowDown' : 'arrowUp',
       size: 0.7,
     })) : []);
@@ -3127,7 +3278,17 @@ initDataSource();
 // Load custom sections in parallel — they may be empty for new users — then
 // restore today's already-processed scan (if any) once sections are available,
 // so custom tabs like "No data" render correctly.
-loadCustomSections().then(() => { try { restoreScanSession(); } catch (_) {} });
+loadCustomSections().then(() => {
+  try { restoreScanSession(); } catch (_) {}
+  // Sections are persistent collections — show them even before today's CSV.
+  if (!(state.results || []).length && (state.customSections || []).length) {
+    // Nothing scanned yet today: open the first section that has stocks in it.
+    const withItems = state.customSections.find(sec =>
+      Object.values(state.assignments || {}).some(ids => (ids || []).includes(sec.id)));
+    if (withItems && (!state.activeTab || state.activeTab === 'all')) state.activeTab = `custom-${withItems.id}`;
+    try { sortAndRerender(); } catch (_) {}
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Top nav: Scan / Holdings
@@ -3384,7 +3545,7 @@ function breadthChart(hist, colors) {
     </svg>
     ${yLbl(max, String(max))}
     ${min !== max ? yLbl(min, String(min)) : ''}
-    <span class="jr-eq-cur" style="top:${dotY}px;color:#fff;background:${col}">${vals[n - 1]}</span>
+    <span class="jr-eq-cur" style="top:${dotY}px;color:var(--on-accent);background:${col}">${vals[n - 1]}</span>
     <span class="jr-eq-xl" style="left:0">${fmtD(hist[0].scan_date)}</span>
     <span class="jr-eq-xl" style="right:0">${fmtD(hist[n - 1].scan_date)}</span>
     <div class="jr-eq-marker hidden"></div>
@@ -3731,6 +3892,23 @@ $('holdingForm').addEventListener('submit', async (e) => {
 
 $('refreshHoldingsBtn').addEventListener('click', renderHoldings);
 
+// Live risk preview while typing a new position
+(function initHoldingHint() {
+  const hint = $('hfHint');
+  if (!hint) return;
+  const upd = () => {
+    const entry = parseNum($('hfEntry').value), stop = parseNum($('hfStop').value), qty = parseNum($('hfQty').value);
+    if (!(entry > 0 && stop > 0)) { hint.textContent = ''; hint.className = 'hf-hint'; return; }
+    if (stop >= entry) { hint.textContent = 'Stop must be below entry'; hint.className = 'hf-hint neg'; return; }
+    const pct = (entry - stop) / entry * 100;
+    const risk = qty > 0 ? ` · risk ₹${Math.round((entry - stop) * qty).toLocaleString('en-IN')}` : '';
+    hint.textContent = `${pct.toFixed(1)}% stop${risk}`;
+    hint.className = 'hf-hint';
+  };
+  ['hfEntry', 'hfStop', 'hfQty'].forEach(id => $(id)?.addEventListener('input', upd));
+  $('holdingForm')?.addEventListener('reset', () => setTimeout(upd, 0));
+})();
+
 $('loadSampleBtn').addEventListener('click', async () => {
   const samples = [
     { symbol: 'MTARTECH', exchange: 'NSE', entry: 3776, stop: 3500, qty: 100 },
@@ -3742,6 +3920,21 @@ $('loadSampleBtn').addEventListener('click', async () => {
   }
   await renderHoldings();
 });
+
+const HT_HEAD = `
+    <div class="ht-head">
+      <div>Symbol</div>
+      <div class="right">Qty</div>
+      <div class="right">Entry</div>
+      <div class="right">CMP</div>
+      <div class="right">Stop</div>
+      <div class="right">P&amp;L</div>
+      <div class="right">P&amp;L %</div>
+      <div class="right">R</div>
+      <div class="right">Open risk</div>
+      <div class="right" title="How far price is above the stop">To stop</div>
+      <div></div>
+    </div>`;
 
 async function renderHoldings() {
   const arr = await fetchHoldingsRaw();
@@ -3757,20 +3950,7 @@ async function renderHoldings() {
   $('holdingsEmpty').classList.add('hidden');
   $('holdingsTable').classList.remove('hidden');
   $('holdingsSummarySection').classList.remove('hidden');
-  $('holdingsTable').innerHTML = `
-    <div class="ht-head">
-      <div>Symbol</div>
-      <div class="right">Entry</div>
-      <div class="right">CMP</div>
-      <div class="right">Qty</div>
-      <div class="right">P&amp;L</div>
-      <div class="right">%</div>
-      <div class="right">Open risk</div>
-      <div class="right">R</div>
-      <div></div>
-    </div>
-    ${loaderHTML('Fetching live prices…')}
-  `;
+  $('holdingsTable').innerHTML = HT_HEAD + loaderHTML('Fetching live prices…');
 
   try {
     const res = await fetch('/api/holdings_refresh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
@@ -3788,85 +3968,74 @@ function renderHoldingsTable(data) {
 
   const pnlCls = (s.total_pnl || 0) >= 0 ? 'pos' : 'neg';
   const fmt = (v) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
+  const money = (v) => (v < 0 ? '−₹' : '₹') + Math.abs(Math.round(v || 0)).toLocaleString('en-IN');
+  const px = (v) => v == null ? '—' : Number(v).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   animateCount($('hsPositions'), String(s.positions || 0));
   animateCount($('hsInvested'), fmt(s.total_invested));
-  const pnlArrow = (s.total_pnl || 0) > 0 ? '▲' : ((s.total_pnl || 0) < 0 ? '▼' : '');
-  $('hsPnl').innerHTML = `<span class="${pnlCls}">${pnlArrow ? `<span class="pnl-glyph">${pnlArrow}</span>` : ''}${(s.total_pnl||0) >= 0 ? '+' : ''}${fmt(s.total_pnl).replace('₹-','-₹')}</span> <span style="font-size:0.75rem;color:var(--text-faint);margin-left:0.3rem">${s.total_pnl_pct > 0 ? '+' : ''}${s.total_pnl_pct}%</span>`;
-  $('hsOpenRisk').innerHTML = `<span class="neg">${fmt(s.total_open_risk)}</span> <span style="font-size:0.75rem;color:var(--text-faint);margin-left:0.3rem">${s.open_risk_pct}% of cap</span>`;
+  $('hsPnl').innerHTML = `<span class="${pnlCls}">${(s.total_pnl || 0) > 0 ? '+' : ''}${money(s.total_pnl)}</span><span class="stat-sub ${pnlCls}">${s.total_pnl_pct > 0 ? '+' : ''}${s.total_pnl_pct ?? 0}%</span>`;
+  $('hsOpenRisk').innerHTML = `<span>${fmt(s.total_open_risk)}</span><span class="stat-sub">${s.open_risk_pct ?? 0}% of capital</span>`;
+
+  const actions = (h, extra = '') => `
+        <div class="right ht-actions">
+          ${extra}
+          <button class="ht-close" data-id="${h.id}" title="Close position — records it to your journal">Close</button>
+          <button class="ht-del" data-id="${h.id}" title="Remove (discard, no journal entry)" aria-label="Remove ${esc(h.symbol)}">${svgIcon('x', 14)}</button>
+        </div>`;
+  const symCell = (h, extra = '') => `
+        <div class="ht-sym"><span class="sym">${esc(h.symbol)}</span>${h.exchange ? `<span class="ht-ex">${esc(h.exchange)}</span>` : ''}${h.source === 'kite' ? '<span class="src-badge" title="Synced from Kite">Kite</span>' : ''}${extra}</div>`;
 
   const rowsHtml = rows.map(h => {
     if (h.error) {
       return `
-        <div class="ht-row" style="opacity:0.6">
-          <div><span class="sym">${h.symbol}</span>${h.source === 'kite' ? '<span class="src-badge" title="Synced from Kite">Kite</span>' : ''}</div>
-          <div class="right muted">${(h.entry||0).toLocaleString('en-IN')}</div>
-          <div class="right muted">Error: ${esc(h.error)}</div>
-          <div></div><div></div><div></div><div></div><div></div>
-          <div class="right ht-actions">
-            <button class="ht-close" data-id="${h.id}" title="Close position — records it to your journal">Close</button>
-            <button class="ht-del" data-id="${h.id}" title="Remove (discard, no journal entry)">×</button>
-          </div>
-        </div>`;
+      <div class="ht-row ht-row-error">
+        ${symCell(h)}
+        <div class="right">${h.qty ?? '—'}</div>
+        <div class="right">${px(h.entry)}</div>
+        <div class="ht-error-msg" title="${esc(h.error)}">Price unavailable — ${esc(h.error)}</div>
+        ${actions(h)}
+      </div>`;
     }
-    const pnlCls = (h.pnl || 0) >= 0 ? 'ht-pos' : 'ht-neg';
-    const rCls = (h.r_multiple || 0) >= 0 ? 'ht-pos' : 'ht-neg';
-    const rowCls = h.stop_hit ? 'ht-row ht-stop-hit' : 'ht-row';
-    const pnlSign = (h.pnl || 0) >= 0 ? '+' : '';
-    const rSign = (h.r_multiple || 0) >= 0 ? '+' : '';
-    const kiteBadge = h.source === 'kite' ? '<span class="src-badge" title="Synced from Kite">Kite</span>' : '';
-    // Long-term hold: no stop by design. Otherwise show the stop / a "set stop" nudge.
-    let slCell, ltBtn;
+    const up = (h.pnl || 0) >= 0;
+    const pnlC = up ? 'pos' : 'neg';
+    const rC = (h.r_multiple || 0) >= 0 ? 'pos' : 'neg';
+    const hasStop = !h.long_term && h.stop < h.entry;
+    let stopCell, ltBtn = '', riskCell, rCell, toStopCell;
     if (h.long_term) {
-      slCell = '<span class="lt-badge" style="margin-left:0.5rem" title="Long-term hold — no stop, excluded from open risk & R">Long-term</span>';
+      stopCell = '<span class="lt-badge" title="Long-term hold — no stop, excluded from open risk & R">Long-term</span>';
       ltBtn = `<button class="ht-lt-btn" data-id="${h.id}" data-lt="0" title="Remove long-term (track a stop again)">Track stop</button>`;
-    } else if (h.stop >= h.entry) {
-      slCell = '<span class="muted stop-unset" style="margin-left:0.5rem" title="No stop set — open risk & R need a stop. Add a stop-loss GTT in Kite and re-sync.">⚠ set stop</span>';
+    } else if (!hasStop) {
+      stopCell = '<span class="stop-unset" title="No stop set — open risk & R need a stop. Add a stop-loss GTT in Kite and re-sync.">Set stop</span>';
       ltBtn = `<button class="ht-lt-btn" data-id="${h.id}" data-lt="1" title="Mark as a long-term hold (no stop expected)">Long-term</button>`;
     } else {
-      slCell = `<span class="muted" style="margin-left:0.5rem">SL ₹${h.stop.toLocaleString('en-IN')}</span>`;
-      ltBtn = '';
+      stopCell = px(h.stop);
     }
-    const riskCell = h.long_term ? '<span class="muted">—</span>' : `₹${Math.round(h.open_risk||0).toLocaleString('en-IN')}`;
-    const rCell = h.long_term ? '<span class="muted">—</span>' : `${rSign}${(h.r_multiple||0).toFixed(2)}R`;
+    riskCell = hasStop ? fmt(h.open_risk) : '<span class="muted">—</span>';
+    rCell = hasStop ? `<span class="${rC}">${(h.r_multiple || 0) >= 0 ? '+' : ''}${(h.r_multiple || 0).toFixed(2)}R</span>` : '<span class="muted">—</span>';
+    if (hasStop && h.cmp) {
+      const d = (h.cmp - h.stop) / h.cmp * 100;
+      toStopCell = `<span class="${d <= 0 ? 'neg' : (d < 3 ? 'warn' : 'muted')}">${d.toFixed(1)}%</span>`;
+    } else toStopCell = '<span class="muted">—</span>';
     return `
-      <div class="${rowCls}">
-        <div>
-          <span class="sym">${h.symbol}</span>${kiteBadge}
-          ${slCell}
-        </div>
-        <div class="right">₹${h.entry.toLocaleString('en-IN')}</div>
-        <div class="right">₹${(h.cmp||0).toLocaleString('en-IN')}</div>
-        <div class="right muted">${h.qty}</div>
-        <div class="right ${pnlCls}">${pnlSign}₹${Math.abs(Math.round(h.pnl||0)).toLocaleString('en-IN')}</div>
-        <div class="right ${pnlCls}">${pnlSign}${(h.pnl_pct||0).toFixed(2)}%</div>
-        <div class="right ${h.long_term ? '' : 'ht-neg'}">${riskCell}</div>
-        <div class="right ${h.long_term ? '' : rCls}">${rCell}</div>
-        <div class="right ht-actions">
-          ${ltBtn}
-          <button class="ht-close" data-id="${h.id}" title="Close position — records it to your journal">Close</button>
-          <button class="ht-del" data-id="${h.id}" title="Remove (discard, no journal entry)">×</button>
-        </div>
+      <div class="ht-row ${h.stop_hit ? 'ht-stop-hit' : ''}">
+        ${symCell(h)}
+        <div class="right">${h.qty}</div>
+        <div class="right muted">${px(h.entry)}</div>
+        <div class="right">${px(h.cmp)}</div>
+        <div class="right muted">${stopCell}</div>
+        <div class="right ${pnlC}">${up ? '+' : ''}${money(h.pnl)}</div>
+        <div class="right ${pnlC}">${up ? '+' : ''}${(h.pnl_pct || 0).toFixed(2)}%</div>
+        <div class="right">${rCell}</div>
+        <div class="right">${riskCell}</div>
+        <div class="right">${toStopCell}</div>
+        ${actions(h, ltBtn)}
       </div>`;
   }).join('');
 
-  $('holdingsTable').innerHTML = `
-    <div class="ht-head">
-      <div>Symbol</div>
-      <div class="right">Entry</div>
-      <div class="right">CMP</div>
-      <div class="right">Qty</div>
-      <div class="right">P&amp;L</div>
-      <div class="right">%</div>
-      <div class="right">Open risk</div>
-      <div class="right">R</div>
-      <div></div>
-    </div>
-    ${rowsHtml}
-  `;
+  $('holdingsTable').innerHTML = HT_HEAD + rowsHtml;
 
   document.querySelectorAll('.ht-del').forEach(btn => {
     btn.addEventListener('click', async (e) => {
-      const id = parseInt(e.target.dataset.id, 10);
+      const id = parseInt(e.currentTarget.dataset.id, 10);
       if (!(await confirmDialog('This removes it from your open positions. Closed-trade history is unaffected.', { title: 'Remove this position?', confirmLabel: 'Remove', danger: true }))) return;
       await deleteHoldingById(id);
       await renderHoldings();
@@ -3919,55 +4088,141 @@ refreshNavCount();
 // ---------------------------------------------------------------------------
 // DRAWING ENGINE
 // ---------------------------------------------------------------------------
-// Drawings are stored per-symbol in SQLite via /api/drawings/<symbol>.
-// An SVG overlay is positioned over the chart container; on every chart update
-// (zoom/pan/range/timeframe) we re-project all drawings from price/time space
-// to pixel coordinates using the chart's priceToCoordinate / timeToCoordinate.
+// Drawings are stored per symbol in SQLite via /api/drawings/<symbol> as
+// { type, name, color, points:[{time, price}] }. An SVG overlay sits on top of
+// the chart; every zoom / pan / resize re-projects the drawings from
+// (time, price) to pixels.
 //
-// Each drawing has: id, kind (rect|hline|trend|arrow), points [{time, price}], label, color.
+// Times are stored as epoch seconds. Projection goes through the chart's
+// *logical* index, so drawings survive timeframe switches, data-source
+// changes, and can extend into the empty space right of the last bar.
+//
+// Tools (Alt + key):
+//   trend T · ray Y · arrow A · hline H · hray J · rect R · position P
+//   fib B · text N · measure M (or Shift + drag) · Esc = back to cursor
+// Other keys: Delete removes the selection, Ctrl/Cmd+Z undoes.
+// ---------------------------------------------------------------------------
+
+const DRAW_COLORS = ['#3b82f6', '#22a06b', '#e5484d', '#e0a030', '#8b5cf6', '#8a8f98'];
+
+const DRAW_TOOLS = {
+  cursor:   { label: 'Select',                     code: null,   icon: '<path d="M5 3l6.5 17 2.3-7 7.2-2.4z"/>' },
+  trend:    { label: 'Trend line',                 code: 'KeyT', pts: 2, icon: '<path d="M4 19 20 5"/><circle cx="4" cy="19" r="1.6"/><circle cx="20" cy="5" r="1.6"/>' },
+  ray:      { label: 'Ray (extends to the right)', code: 'KeyY', pts: 2, icon: '<path d="M4 19 22 3"/><circle cx="4" cy="19" r="1.6"/><circle cx="12" cy="12" r="1.6"/>' },
+  arrow:    { label: 'Arrow',                      code: 'KeyA', pts: 2, icon: '<path d="M5 19 19 5M10 5h9v9"/>' },
+  hline:    { label: 'Horizontal line',            code: 'KeyH', pts: 1, icon: '<path d="M2 12h20"/><circle cx="12" cy="12" r="1.6"/>' },
+  hray:     { label: 'Horizontal ray (support / resistance from a point)', code: 'KeyJ', pts: 1, icon: '<path d="M6 12h16"/><circle cx="5" cy="12" r="1.8"/>' },
+  rect:     { label: 'Rectangle / zone',           code: 'KeyR', pts: 2, icon: '<rect x="4" y="6" width="16" height="12" rx="1"/>' },
+  position: { label: 'Risk / reward — click entry, drag to stop', code: 'KeyP', pts: 2, icon: '<rect x="4" y="4" width="16" height="7" rx="1" opacity=".55"/><rect x="4" y="13" width="16" height="7" rx="1"/><path d="M2 12h20"/>' },
+  fib:      { label: 'Fibonacci retracement — drag from swing high to swing low', code: 'KeyB', pts: 2, icon: '<path d="M3 5h18M3 9.5h18M3 13h18M3 19h18"/>' },
+  text:     { label: 'Text note',                  code: 'KeyN', pts: 1, icon: '<path d="M5 6V4h14v2M12 4v16M9 20h6"/>' },
+  measure:  { label: 'Measure (or Shift + drag) — not saved', code: 'KeyM', pts: 2, icon: '<path d="M4 20 20 4M4 20v-5M4 20h5M20 4v5M20 4h-5"/>' },
+};
+// Tools whose line thickness / style can be changed, and their defaults
+const LINE_KINDS = new Set(['trend', 'ray', 'arrow', 'hline', 'hray', 'rect', 'fib']);
+const LINE_WIDTHS = [1, 2, 3, 4];
+const LINE_STYLES = [['solid', 'Solid'], ['dashed', 'Dashed'], ['dotted', 'Dotted']];
+const DEFAULT_LINE = { trend: [2, 'solid'], ray: [2, 'solid'], arrow: [2, 'solid'], hline: [1.5, 'dashed'], hray: [2, 'solid'], rect: [1.5, 'solid'], fib: [1.5, 'dotted'] };
+function lineOf(d) {
+  const [w, st] = DEFAULT_LINE[d.kind] || [1.5, 'solid'];
+  return { width: d.width > 0 ? d.width : w, style: d.lineStyle || st };
+}
+function dashFor(style, w) {
+  if (style === 'dashed') return `stroke-dasharray="${Math.max(5, w * 3.5)} ${Math.max(4, w * 2.5)}"`;
+  if (style === 'dotted') return `stroke-dasharray="0.1 ${Math.max(3.5, w * 2.6)}" stroke-linecap="round"`;
+  return '';
+}
+
+const DRAW_GROUPS = [['cursor'], ['trend', 'ray', 'arrow'], ['hline', 'hray'], ['rect', 'position', 'fib'], ['text', 'measure']];
+
+function _lsGet(k, fb) { try { const v = localStorage.getItem(k); return v == null ? fb : JSON.parse(v); } catch { return fb; } }
+function _lsSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
 
 let _drawState = {
   tool: 'cursor',
+  lock: false,                  // stay in the tool after drawing (double-click a tool)
   symbol: null,
-  drawings: [],         // [{id, kind, points, label, color}]
-  drafting: null,       // currently-being-drawn shape (no id yet)
-  hoverId: null,
+  drawings: [],                 // [{id, kind, points, label, color}]
+  drafting: null,               // shape being drawn (no id yet)
+  measure: null,                // transient measure result (never saved)
   selectedId: null,
+  magnet: _lsGet('vcp_draw_magnet', true),
+  hidden: _lsGet('vcp_draw_hidden', false),
+  color: _lsGet('vcp_draw_color', DRAW_COLORS[0]),
+  width: _lsGet('vcp_draw_width', 0),          // 0 = tool default
+  lineStyle: _lsGet('vcp_draw_style', ''),     // '' = tool default
+  hover: null,                  // {time, price} under the mouse while a 1-point tool is active
 };
+let _editDrag = null;           // { id, mode:'handle'|'body', handleIdx, originalPoints, startLogical, startPrice }
+const _drawUndo = [];           // [{type:'add'|'delete'|'update', ...}]
+
+function resetDrawState() {
+  _drawState.symbol = null;
+  _drawState.drawings = [];
+  _drawState.drafting = null;
+  _drawState.measure = null;
+  _drawState.selectedId = null;
+  _drawState.tool = 'cursor';
+  _drawState.lock = false;
+  _editDrag = null;
+  _drawUndo.length = 0;
+}
 
 function getOverlay() { return document.getElementById('drawOverlay'); }
 
+function drawIcon(kind, size = 16) {
+  return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${DRAW_TOOLS[kind].icon}</svg>`;
+}
+
+function drawRailHTML() {
+  const btn = k => {
+    const t = DRAW_TOOLS[k];
+    const key = t.code ? ` (Alt+${t.code.slice(3)})` : ' (Esc)';
+    return `<button class="draw-btn ${k === 'cursor' ? 'active' : ''}" data-tool="${k}" title="${t.label}${key}" aria-label="${t.label}">${drawIcon(k)}</button>`;
+  };
+  return DRAW_GROUPS.map(g => g.map(btn).join('')).join('<span class="rail-sep"></span>') + `
+    <span class="rail-sep"></span>
+    <button class="draw-btn rail-toggle ${_drawState.magnet ? 'on' : ''}" id="drawMagnet" title="Magnet: snap to candle open / high / low / close" aria-pressed="${_drawState.magnet}" aria-label="Magnet">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3v8a6 6 0 0 0 12 0V3h-4v8a2 2 0 0 1-4 0V3z"/><path d="M6 7h4M14 7h4"/></svg>
+    </button>
+    <button class="draw-btn rail-toggle ${_drawState.hidden ? 'on' : ''}" id="drawHide" title="Hide all drawings" aria-pressed="${_drawState.hidden}" aria-label="Hide drawings">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>
+    </button>
+    <button class="draw-btn" id="drawUndo" title="Undo (Ctrl+Z)" aria-label="Undo" disabled>
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 14 4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 0 10h-3"/></svg>
+    </button>
+    <button class="draw-btn rail-danger" id="clearDrawingsBtn" title="Remove all drawings on this chart" aria-label="Remove all drawings">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>
+    </button>`;
+}
+
+// ---------------------------------------------------------------------------
+// Persistence
+// ---------------------------------------------------------------------------
 async function loadDrawingsFor(symbol) {
   _drawState.symbol = symbol;
   _drawState.drawings = [];
   _drawState.drafting = null;
+  _drawState.measure = null;
+  _drawUndo.length = 0;
+  updateUndoButton();
   try {
     const r = await fetch(`/api/drawings/${encodeURIComponent(symbol)}`);
     const j = await r.json();
-    // Translate backend {type, name} -> internal {kind, label}
+    if (_drawState.symbol !== symbol) return;        // user already moved on
     _drawState.drawings = (j.drawings || []).map(d => ({
-      id: d.id,
-      kind: d.type,
-      label: d.name,
-      color: d.color,
-      points: d.points,
+      id: d.id, kind: d.type, label: d.name || null, color: d.color, points: d.points,
+      width: Number(d.line_width) || 0, lineStyle: d.line_style || '',
     }));
   } catch {}
   renderOverlay();
 }
 
 async function saveDrawing(drawing) {
-  // Backend expects { type, name, color, points } — translate from internal {kind,label}
-  const body = {
-    type: drawing.kind,
-    name: drawing.label,
-    color: drawing.color,
-    points: drawing.points,
-  };
   const r = await fetch(`/api/drawings/${encodeURIComponent(_drawState.symbol)}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type: drawing.kind, name: drawing.label, color: drawing.color, points: drawing.points,
+                           line_width: drawing.width || 0, line_style: drawing.lineStyle || '' }),
   });
   const j = await r.json();
   if (!r.ok) throw new Error(j.error || 'Save failed');
@@ -3978,281 +4233,9 @@ async function deleteDrawingApi(id) {
   await fetch(`/api/drawings/${id}`, { method: 'DELETE' });
 }
 
-async function clearAllDrawings() {
-  if (!_drawState.symbol) return;
-  if (!(await confirmDialog('This removes every drawing on this chart and cannot be undone.', { title: `Remove all drawings on ${_drawState.symbol}?`, confirmLabel: 'Remove all', danger: true }))) return;
-  await fetch(`/api/drawings/${encodeURIComponent(_drawState.symbol)}/clear`, { method: 'POST' });
-  _drawState.drawings = [];
-  renderOverlay();
-}
-
-// Wire up drawing toolbar buttons (called from openModal)
-function wireDrawTools() {
-  document.querySelectorAll('.draw-btn').forEach(b => {
-    b.addEventListener('click', () => {
-      document.querySelectorAll('.draw-btn').forEach(x => x.classList.remove('active'));
-      b.classList.add('active');
-      _drawState.tool = b.dataset.tool;
-      const overlay = getOverlay();
-      if (overlay) overlay.classList.toggle('active', _drawState.tool !== 'cursor');
-    });
-  });
-  const clearBtn = document.getElementById('clearDrawingsBtn');
-  if (clearBtn) clearBtn.addEventListener('click', clearAllDrawings);
-
-  // Mouse handlers on the overlay
-  const overlay = getOverlay();
-  if (!overlay) return;
-  overlay.addEventListener('mousedown', onOverlayMouseDown);
-  overlay.addEventListener('mousemove', onOverlayMouseMove);
-  overlay.addEventListener('mouseup', onOverlayMouseUp);
-  overlay.addEventListener('contextmenu', onOverlayContextMenu);
-}
-
-// --- Coordinate conversions ----------------------------------------------
-function pxToTimePrice(x, y) {
-  if (!_activeChart || !_activeSeries) return null;
-  // For time, lightweight-charts gives logical-index → time
-  const ts = _activeChart.timeScale();
-  const logicalIdx = ts.coordinateToLogical(x);
-  // Round to nearest bar
-  const idx = Math.round(logicalIdx);
-  const data = _activeData;
-  if (!data || data.length === 0) return null;
-  const clamped = Math.max(0, Math.min(data.length - 1, idx));
-  const bar = data[clamped];
-  if (!bar) return null;
-  const price = _activeSeries.coordinateToPrice(y);
-  if (price == null) return null;
-  // Store a normalized epoch-seconds anchor (not the raw bar.time, which is a date
-  // string on the initial render and an epoch on the timeframe-switch path). This
-  // keeps drawings source- and format-independent going forward.
-  const epoch = timeToEpoch(bar.time);
-  return { time: isNaN(epoch) ? bar.time : epoch, price };
-}
-
-// Convert any lightweight-charts time (date string 'YYYY-MM-DD', epoch seconds,
-// or {year,month,day}) to comparable epoch seconds, for nearest-bar matching.
-function timeToEpoch(t) {
-  if (t == null) return NaN;
-  if (typeof t === 'number') return t;
-  if (typeof t === 'string') { const ms = Date.parse(t.length <= 10 ? t + 'T00:00:00Z' : t); return isNaN(ms) ? NaN : ms / 1000; }
-  if (typeof t === 'object' && t.year) return Date.UTC(t.year, (t.month || 1) - 1, t.day || 1) / 1000;
-  return NaN;
-}
-
-function timePriceToPx(time, price) {
-  if (!_activeChart || !_activeSeries) return null;
-  const ts = _activeChart.timeScale();
-  let x = ts.timeToCoordinate(time);
-  // A drawing anchored to a date that isn't an exact bar on the *current* series
-  // (different data source / trading calendar / time format — e.g. yfinance vs Kite)
-  // makes timeToCoordinate return null and the shape silently vanishes. Snap to the
-  // nearest loaded bar by time so the drawing still renders.
-  if (x == null && _activeData && _activeData.length) {
-    const target = timeToEpoch(time);
-    if (!isNaN(target)) {
-      let bestI = -1, bestD = Infinity;
-      for (let i = 0; i < _activeData.length; i++) {
-        const d = Math.abs(timeToEpoch(_activeData[i].time) - target);
-        if (d < bestD) { bestD = d; bestI = i; }
-      }
-      if (bestI >= 0) { const cx = ts.logicalToCoordinate(bestI); if (cx != null) x = cx; }
-    }
-  }
-  const y = _activeSeries.priceToCoordinate(price);
-  if (x == null || y == null) return null;
-  return { x, y };
-}
-
-// --- Mouse handlers -------------------------------------------------------
-// State for in-progress edit dragging
-let _editDrag = null;
-// _editDrag = { id, mode: 'handle'|'body', handleIdx, originalPoints, startTpoint }
-
-function onOverlayMouseDown(e) {
-  // Only left click
-  if (e.button !== 0) return;
-
-  const target = e.target;
-  const rect = getOverlay().getBoundingClientRect();
-  const x = e.clientX - rect.left;
-  const y = e.clientY - rect.top;
-
-  // CASE 1: clicked a handle on the selected drawing → start handle drag
-  if (target?.classList?.contains('draw-handle')) {
-    e.preventDefault(); e.stopPropagation();
-    const id = parseInt(target.dataset.drawId, 10);
-    const handleIdx = parseInt(target.dataset.handleIdx, 10);
-    const drawing = _drawState.drawings.find(d => d.id === id);
-    if (!drawing) return;
-    _editDrag = {
-      id, mode: 'handle', handleIdx,
-      originalPoints: drawing.points.map(p => ({ ...p })),
-    };
-    return;
-  }
-
-  // CASE 2: clicked an existing drawing body → select + maybe start body-drag
-  const drawIdAttr = target?.dataset?.drawId;
-  if (_drawState.tool === 'cursor' && drawIdAttr) {
-    e.preventDefault(); e.stopPropagation();
-    const id = parseInt(drawIdAttr, 10);
-    _drawState.selectedId = id;
-    const drawing = _drawState.drawings.find(d => d.id === id);
-    const tp = pxToTimePrice(x, y);
-    if (drawing && tp) {
-      _editDrag = {
-        id, mode: 'body',
-        originalPoints: drawing.points.map(p => ({ ...p })),
-        startTpoint: tp,
-      };
-    }
-    renderOverlay();
-    showEditPopover(id);
-    return;
-  }
-
-  // CASE 3: cursor tool clicked empty area → deselect
-  if (_drawState.tool === 'cursor') {
-    if (_drawState.selectedId !== null) {
-      _drawState.selectedId = null;
-      hideEditPopover();
-      renderOverlay();
-    }
-    return;
-  }
-
-  // CASE 4: drawing tool active → start a new draft
-  e.preventDefault(); e.stopPropagation();
-  const tp = pxToTimePrice(x, y);
-  if (!tp) return;
-
-  const color = document.getElementById('drawColor').value;
-  const label = document.getElementById('drawLabel').value.trim() || null;
-
-  if (_drawState.tool === 'hline') {
-    _drawState.drafting = { kind: 'hline', points: [tp], label, color, _live: true };
-    commitDraft();
-  } else {
-    _drawState.drafting = {
-      kind: _drawState.tool,
-      points: [tp, tp],
-      label, color, _live: true,
-    };
-  }
-  renderOverlay();
-}
-
-function onOverlayMouseMove(e) {
-  // EDIT-DRAG: handle or body
-  if (_editDrag) {
-    const rect = getOverlay().getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-    const tp = pxToTimePrice(x, y);
-    if (!tp) return;
-    const drawing = _drawState.drawings.find(d => d.id === _editDrag.id);
-    if (!drawing) return;
-
-    if (_editDrag.mode === 'handle') {
-      drawing.points[_editDrag.handleIdx] = tp;
-    } else {
-      // body drag — translate every point by the delta from startTpoint
-      // Approximate: shift by the same time/price delta
-      const dPrice = tp.price - _editDrag.startTpoint.price;
-      // Time delta is harder (categorical for daily); shift by index instead
-      const data = _activeData;
-      if (!data) return;
-      const startIdx = data.findIndex(d => d.time === _editDrag.startTpoint.time);
-      const nowIdx = data.findIndex(d => d.time === tp.time);
-      const dIdx = (startIdx >= 0 && nowIdx >= 0) ? (nowIdx - startIdx) : 0;
-      drawing.points = _editDrag.originalPoints.map(p => {
-        let newTime = p.time;
-        if (dIdx !== 0) {
-          const i = data.findIndex(d => d.time === p.time);
-          if (i >= 0) {
-            const ni = Math.max(0, Math.min(data.length - 1, i + dIdx));
-            newTime = data[ni].time;
-          }
-        }
-        return { time: newTime, price: p.price + dPrice };
-      });
-    }
-    renderOverlay();
-    positionEditPopover();
-    return;
-  }
-
-  // DRAFT: in-progress draw
-  if (!_drawState.drafting || _drawState.drafting.kind === 'hline') return;
-  const rect = getOverlay().getBoundingClientRect();
-  const x = e.clientX - rect.left;
-  const y = e.clientY - rect.top;
-  const tp = pxToTimePrice(x, y);
-  if (!tp) return;
-  _drawState.drafting.points[1] = tp;
-  renderOverlay();
-}
-
-function onOverlayMouseUp(e) {
-  // Finish edit-drag
-  if (_editDrag) {
-    const drawing = _drawState.drawings.find(d => d.id === _editDrag.id);
-    if (drawing) {
-      // Persist the new points only if they actually changed
-      const before = _editDrag.originalPoints;
-      const changed = JSON.stringify(before) !== JSON.stringify(drawing.points);
-      if (changed) {
-        patchDrawing(drawing.id, { points: drawing.points }).catch(err => {
-          showToast('Save failed: ' + err.message, 'error');
-          drawing.points = before;
-          renderOverlay();
-        });
-      }
-    }
-    _editDrag = null;
-    return;
-  }
-
-  // Finish draft
-  if (!_drawState.drafting || _drawState.drafting.kind === 'hline') return;
-  const p0 = _drawState.drafting.points[0];
-  const p1 = _drawState.drafting.points[1];
-  const px0 = timePriceToPx(p0.time, p0.price);
-  const px1 = timePriceToPx(p1.time, p1.price);
-  if (px0 && px1 && Math.hypot(px1.x - px0.x, px1.y - px0.y) < 5) {
-    _drawState.drafting = null;
-    renderOverlay();
-    return;
-  }
-  commitDraft();
-}
-
-function onOverlayContextMenu(e) {
-  const id = e.target?.dataset?.drawId;
-  if (!id) return;
-  e.preventDefault();
-  confirmDialog('', { title: 'Delete this drawing?', confirmLabel: 'Delete', danger: true }).then(ok => {
-    if (!ok) return;
-    const numId = parseInt(id, 10);
-    deleteDrawingApi(numId).then(() => {
-      _drawState.drawings = _drawState.drawings.filter(d => d.id !== numId);
-      if (_drawState.selectedId === numId) {
-        _drawState.selectedId = null;
-        hideEditPopover();
-      }
-      renderOverlay();
-    });
-  });
-}
-
-// --- PATCH helper for edits -----------------------------------------------
 async function patchDrawing(id, fields) {
   const r = await fetch(`/api/drawings/${id}`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(fields),
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(fields),
   });
   if (!r.ok) {
     const j = await r.json().catch(() => ({}));
@@ -4261,10 +4244,553 @@ async function patchDrawing(id, fields) {
   return r.json();
 }
 
-// --- Edit popover ---------------------------------------------------------
+const _snapshot = d => ({ points: d.points.map(p => ({ ...p })), label: d.label, color: d.color, width: d.width || 0, lineStyle: d.lineStyle || '' });
+
+function pushUndo(entry) {
+  _drawUndo.push(entry);
+  if (_drawUndo.length > 50) _drawUndo.shift();
+  updateUndoButton();
+}
+function updateUndoButton() {
+  const b = document.getElementById('drawUndo');
+  if (b) b.disabled = _drawUndo.length === 0;
+}
+
+async function undoDraw() {
+  const u = _drawUndo.pop();
+  updateUndoButton();
+  if (!u) return;
+  try {
+    if (u.type === 'add') {
+      await deleteDrawingApi(u.id);
+      _drawState.drawings = _drawState.drawings.filter(d => d.id !== u.id);
+      if (_drawState.selectedId === u.id) deselectDrawing();
+    } else if (u.type === 'delete') {
+      for (const d of u.drawings) {
+        const { oldId, ...rec } = d;
+        const id = await saveDrawing(rec);
+        _drawState.drawings.push({ ...rec, id });
+        // Re-created drawings get a new id — point older undo steps at it
+        _drawUndo.forEach(x => { if (x.id === oldId) x.id = id; });
+      }
+    } else if (u.type === 'update') {
+      const d = _drawState.drawings.find(x => x.id === u.id);
+      if (d) {
+        Object.assign(d, { points: u.before.points, label: u.before.label, color: u.before.color, width: u.before.width, lineStyle: u.before.lineStyle });
+        await patchDrawing(u.id, { points: d.points, name: d.label || '', color: d.color, line_width: d.width || 0, line_style: d.lineStyle || '' });
+      }
+    }
+  } catch (e) { showToast('Undo failed: ' + e.message, 'error'); }
+  renderOverlay();
+}
+
+async function removeDrawings(ids, { toast = true } = {}) {
+  const gone = _drawState.drawings.filter(d => ids.includes(d.id));
+  if (!gone.length) return;
+  _drawState.drawings = _drawState.drawings.filter(d => !ids.includes(d.id));
+  if (ids.includes(_drawState.selectedId)) deselectDrawing();
+  renderOverlay();
+  try {
+    await Promise.all(ids.map(deleteDrawingApi));
+    pushUndo({ type: 'delete', drawings: gone.map(d => ({ oldId: d.id, kind: d.kind, label: d.label, color: d.color, points: d.points, width: d.width || 0, lineStyle: d.lineStyle || '' })) });
+    if (toast) showToast(gone.length === 1 ? 'Drawing removed' : `${gone.length} drawings removed`, 'info', 4000, { label: 'Undo', fn: undoDraw });
+  } catch (e) { showToast('Delete failed: ' + e.message, 'error'); }
+}
+
+async function clearAllDrawings() {
+  if (!_drawState.symbol || !_drawState.drawings.length) return;
+  const n = _drawState.drawings.length;
+  if (!(await confirmDialog(`Removes all ${n} drawing${n === 1 ? '' : 's'} on this chart. You can undo it right after.`, { title: `Remove drawings on ${_drawState.symbol}?`, confirmLabel: 'Remove all', danger: true }))) return;
+  await removeDrawings(_drawState.drawings.map(d => d.id));
+}
+
+// ---------------------------------------------------------------------------
+// Coordinates: (time, price) <-> pixels, via the logical bar index
+// ---------------------------------------------------------------------------
+function timeToEpoch(t) {
+  if (t == null) return NaN;
+  if (typeof t === 'number') return t;
+  if (typeof t === 'string') { const ms = Date.parse(t.length <= 10 ? t + 'T00:00:00Z' : t); return isNaN(ms) ? NaN : ms / 1000; }
+  if (typeof t === 'object' && t.year) return Date.UTC(t.year, (t.month || 1) - 1, t.day || 1) / 1000;
+  return NaN;
+}
+
+let _epochCache = { data: null, epochs: [], iv: 86400 };
+function barEpochs() {
+  if (_epochCache.data !== _activeData || _epochCache.epochs.length !== (_activeData || []).length) {
+    const e = (_activeData || []).map(b => timeToEpoch(b.time));
+    const diffs = [];
+    for (let i = Math.max(1, e.length - 30); i < e.length; i++) diffs.push(e[i] - e[i - 1]);
+    diffs.sort((a, b) => a - b);
+    _epochCache = { data: _activeData, epochs: e, iv: diffs.length ? diffs[diffs.length >> 1] || 86400 : 86400 };
+  }
+  return _epochCache;
+}
+
+// Fractional logical index for a stored time (extrapolates beyond the data).
+function logicalOfTime(t) {
+  const { epochs, iv } = barEpochs();
+  const n = epochs.length;
+  const e = timeToEpoch(t);
+  if (!n || isNaN(e)) return null;
+  if (e >= epochs[n - 1]) return (n - 1) + (e - epochs[n - 1]) / iv;
+  if (e <= epochs[0]) return (e - epochs[0]) / iv;
+  let lo = 0, hi = n - 1;                       // nearest bar by binary search
+  while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (epochs[mid] <= e) lo = mid; else hi = mid; }
+  return (e - epochs[lo]) <= (epochs[hi] - e) ? lo : hi;
+}
+
+function timeOfLogical(i) {
+  const { epochs, iv } = barEpochs();
+  const n = epochs.length;
+  if (!n) return null;
+  if (i >= 0 && i <= n - 1) return epochs[i];
+  return i > n - 1 ? epochs[n - 1] + (i - (n - 1)) * iv : epochs[0] + i * iv;
+}
+
+function pxToTimePrice(x, y, { snap = false } = {}) {
+  if (!_activeChart || !_activeSeries || !_activeData || !_activeData.length) return null;
+  const logical = _activeChart.timeScale().coordinateToLogical(x);
+  if (logical == null) return null;
+  const i = Math.round(logical);
+  let price = _activeSeries.coordinateToPrice(y);
+  if (price == null) return null;
+  if (snap && _drawState.magnet && i >= 0 && i < _activeData.length) {
+    const bar = _activeData[i];
+    let best = null, bestD = 14;               // px radius
+    for (const v of [bar.high, bar.low, bar.open, bar.close]) {
+      const cy = _activeSeries.priceToCoordinate(v);
+      if (cy != null && Math.abs(cy - y) < bestD) { bestD = Math.abs(cy - y); best = v; }
+    }
+    if (best != null) price = best;
+  }
+  return { time: timeOfLogical(i), price, idx: i };
+}
+
+function timePriceToPx(time, price) {
+  if (!_activeChart || !_activeSeries) return null;
+  const l = logicalOfTime(time);
+  if (l == null) return null;
+  const x = _activeChart.timeScale().logicalToCoordinate(l);
+  const y = _activeSeries.priceToCoordinate(price);
+  if (x == null || y == null) return null;
+  return { x, y };
+}
+
+function paneSize() {
+  const host = document.getElementById('detailChart');
+  const w = host ? host.clientWidth : 0, h = host ? host.clientHeight : 0;
+  let pw = w, ph = h;
+  try { pw = w - (_activeChart.priceScale('right').width() || 0); } catch {}
+  try { ph = h - (_activeChart.timeScale().height() || 0); } catch {}
+  return { w, h, pw, ph };
+}
+
+// ---------------------------------------------------------------------------
+// Tool selection, HUD, keyboard
+// ---------------------------------------------------------------------------
+function setDrawTool(tool, { lock = false } = {}) {
+  if (!DRAW_TOOLS[tool]) tool = 'cursor';
+  _drawState.tool = tool;
+  _drawState.lock = tool !== 'cursor' && lock;
+  _drawState.drafting = null;
+  _drawState.hover = null;
+  if (tool !== 'cursor') deselectDrawing(false);
+  document.querySelectorAll('#drawRail .draw-btn[data-tool]').forEach(b => {
+    b.classList.toggle('active', b.dataset.tool === tool);
+    b.classList.toggle('locked', b.dataset.tool === tool && _drawState.lock);
+  });
+  getOverlay()?.classList.toggle('active', tool !== 'cursor');
+  renderDrawHud();
+  renderOverlay();
+}
+
+function colorSwatches(current, attr) {
+  return DRAW_COLORS.map(c =>
+    `<button class="swatch ${c.toLowerCase() === String(current).toLowerCase() ? 'on' : ''}" ${attr}="${c}" style="--sw:${c}" title="${c}" aria-label="Colour ${c}"></button>`
+  ).join('');
+}
+
+// Line thickness + style pickers (used in the tool bar and the edit popover).
+// `cur` is the effective {width, style}; clicking reports the chosen value.
+function linePickers(kind, cur, attr) {
+  const wBtns = LINE_WIDTHS.map(w =>
+    `<button class="lp-btn ${Math.abs(cur.width - w) < 0.3 ? 'on' : ''}" ${attr}-width="${w}" title="${w}px line" aria-label="Line width ${w}">
+       <svg width="18" height="14" viewBox="0 0 18 14" aria-hidden="true"><line x1="2" y1="7" x2="16" y2="7" stroke="currentColor" stroke-width="${w}" stroke-linecap="round"/></svg></button>`).join('');
+  const sBtns = LINE_STYLES.map(([st, lbl]) =>
+    `<button class="lp-btn ${cur.style === st ? 'on' : ''}" ${attr}-style="${st}" title="${lbl}" aria-label="${lbl} line">
+       <svg width="18" height="14" viewBox="0 0 18 14" aria-hidden="true"><line x1="2" y1="7" x2="16" y2="7" stroke="currentColor" stroke-width="2" ${st === 'dashed' ? 'stroke-dasharray="4 3"' : st === 'dotted' ? 'stroke-dasharray="0.1 3.5" stroke-linecap="round"' : ''}/></svg></button>`).join('');
+  return `<span class="line-pick" role="group" aria-label="Line width">${wBtns}</span><span class="line-pick" role="group" aria-label="Line style">${sBtns}</span>`;
+}
+
+// Small floating bar shown while a tool is active: name, colour, label, hint.
+function renderDrawHud() {
+  const hud = document.getElementById('drawHud');
+  if (!hud) return;
+  const t = _drawState.tool;
+  if (t === 'cursor') { hud.classList.add('hidden'); hud.innerHTML = ''; return; }
+  const labelled = !['measure', 'position', 'text'].includes(t);
+  const hint = {
+    hline: 'Click to place', hray: 'Click to place', text: 'Click to place, then type',
+    position: 'Click the entry, drag to the stop — target defaults to 2R',
+    measure: 'Drag to measure', fib: 'Drag from swing high to swing low',
+  }[t] || 'Drag, or click twice';
+  hud.innerHTML = `
+    <span class="hud-name">${drawIcon(t, 14)}${DRAW_TOOLS[t].label.split(' — ')[0].split(' (')[0]}${_drawState.lock ? ' <em>· locked</em>' : ''}</span>
+    ${t === 'measure' ? '' : `<span class="hud-swatches">${colorSwatches(_drawState.color, 'data-hud-color')}</span>`}
+    ${LINE_KINDS.has(t) ? linePickers(t, lineOf({ kind: t, width: _drawState.width, lineStyle: _drawState.lineStyle }), 'data-hud') : ''}
+    ${labelled ? '<input type="text" id="drawLabel" placeholder="Label (optional)" maxlength="40" aria-label="Label for the next drawing">' : ''}
+    <span class="hud-hint">${hint} · <kbd>Esc</kbd> cancel</span>`;
+  hud.classList.remove('hidden');
+  hud.querySelectorAll('[data-hud-color]').forEach(b => b.addEventListener('click', () => {
+    _drawState.color = b.dataset.hudColor;
+    _lsSet('vcp_draw_color', _drawState.color);
+    hud.querySelectorAll('[data-hud-color]').forEach(x => x.classList.toggle('on', x === b));
+  }));
+  hud.querySelectorAll('[data-hud-width]').forEach(b => b.addEventListener('click', () => {
+    _drawState.width = Number(b.dataset.hudWidth); _lsSet('vcp_draw_width', _drawState.width);
+    hud.querySelectorAll('[data-hud-width]').forEach(x => x.classList.toggle('on', x === b));
+    renderOverlay();
+  }));
+  hud.querySelectorAll('[data-hud-style]').forEach(b => b.addEventListener('click', () => {
+    _drawState.lineStyle = b.dataset.hudStyle; _lsSet('vcp_draw_style', _drawState.lineStyle);
+    hud.querySelectorAll('[data-hud-style]').forEach(x => x.classList.toggle('on', x === b));
+    renderOverlay();
+  }));
+}
+
+function wireDrawTools() {
+  const rail = document.getElementById('drawRail');
+  if (rail) {
+    rail.querySelectorAll('.draw-btn[data-tool]').forEach(b => {
+      b.addEventListener('click', () => {
+        const t = b.dataset.tool;
+        if (_drawState.tool === t && t !== 'cursor') setDrawTool('cursor');
+        else setDrawTool(t);
+      });
+      // Double-click keeps the tool active for several drawings in a row
+      b.addEventListener('dblclick', () => { if (b.dataset.tool !== 'cursor') setDrawTool(b.dataset.tool, { lock: true }); });
+    });
+    document.getElementById('drawMagnet')?.addEventListener('click', (e) => {
+      _drawState.magnet = !_drawState.magnet; _lsSet('vcp_draw_magnet', _drawState.magnet);
+      e.currentTarget.classList.toggle('on', _drawState.magnet);
+      e.currentTarget.setAttribute('aria-pressed', _drawState.magnet);
+    });
+    document.getElementById('drawHide')?.addEventListener('click', (e) => {
+      _drawState.hidden = !_drawState.hidden; _lsSet('vcp_draw_hidden', _drawState.hidden);
+      e.currentTarget.classList.toggle('on', _drawState.hidden);
+      e.currentTarget.setAttribute('aria-pressed', _drawState.hidden);
+      e.currentTarget.title = _drawState.hidden ? 'Show drawings' : 'Hide all drawings';
+      if (_drawState.hidden) deselectDrawing(false);
+      renderOverlay();
+    });
+    document.getElementById('drawUndo')?.addEventListener('click', undoDraw);
+    document.getElementById('clearDrawingsBtn')?.addEventListener('click', clearAllDrawings);
+  }
+  setDrawTool('cursor');
+  updateUndoButton();
+
+  const overlay = getOverlay();
+  if (overlay) {
+    overlay.addEventListener('mousedown', onOverlayMouseDown);
+    overlay.addEventListener('mouseleave', () => { if (_drawState.hover) { _drawState.hover = null; renderOverlay(); } });
+    overlay.addEventListener('contextmenu', onOverlayContextMenu);
+    overlay.addEventListener('dblclick', (e) => {
+      const id = parseInt(e.target?.dataset?.drawId, 10);
+      if (!isNaN(id)) { selectDrawing(id); setTimeout(() => document.getElementById('dpName')?.focus(), 0); }
+    });
+  }
+  // Mouse move/up on the window so drags keep working outside the overlay
+  window.removeEventListener('mousemove', onOverlayMouseMove);
+  window.removeEventListener('mouseup', onOverlayMouseUp);
+  window.addEventListener('mousemove', onOverlayMouseMove);
+  window.addEventListener('mouseup', onOverlayMouseUp);
+
+  // Shift + drag on the chart = quick measure, without picking the tool
+  const host = document.getElementById('detailChart');
+  host?.addEventListener('mousedown', (e) => {
+    if (e.button !== 0 || _drawState.tool !== 'cursor') return;
+    if (e.target.closest('.draw-edit-popover, .draw-hud')) return;
+    if (!e.shiftKey) {
+      // Plain click on empty chart (cursor mode): drop the selection and any
+      // measurement, but let the chart pan as usual.
+      if (e.target.dataset?.drawId || e.target.classList?.contains('draw-handle')) return;
+      if (_drawState.measure) { _drawState.measure = null; renderOverlay(); }
+      if (_drawState.selectedId !== null) deselectDrawing();
+      return;
+    }
+    e.preventDefault(); e.stopPropagation();
+    _drawState._quickMeasure = true;
+    _drawState.tool = 'measure';
+    getOverlay()?.classList.add('active');
+    startDraft(e);
+  }, true);
+}
+
+// Global drawing shortcuts. Runs in the capture phase so Esc can be consumed
+// here (cancel draft / leave tool / deselect) before it closes the chart.
+window.addEventListener('keydown', (e) => {
+  if ($('modal')?.classList.contains('hidden') || !document.getElementById('drawOverlay')) return;
+  if (document.querySelector('.confirm-backdrop:not(.hidden), .modal-backdrop:not(#modal)')) return;
+  const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName);
+
+  if (e.key === 'Escape') {
+    if (typing && e.target.closest('.draw-edit-popover, .draw-hud')) { e.target.blur(); }
+    if (_drawState.drafting || _drawState.measure || _drawState.tool !== 'cursor' || _drawState.selectedId !== null) {
+      e.preventDefault();
+      _drawState.measure = null;
+      if (_drawState.tool !== 'cursor') setDrawTool('cursor');
+      else if (_drawState.selectedId !== null) deselectDrawing();
+      else { _drawState.drafting = null; renderOverlay(); }
+    }
+    return;
+  }
+  if (typing) return;
+  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.code === 'KeyZ') {
+    e.preventDefault(); undoDraw(); return;
+  }
+  if ((e.key === 'Delete' || e.key === 'Backspace') && _drawState.selectedId !== null) {
+    e.preventDefault(); e.stopPropagation();
+    removeDrawings([_drawState.selectedId]);
+    return;
+  }
+  if (e.altKey && !e.ctrlKey && !e.metaKey) {
+    const tool = Object.keys(DRAW_TOOLS).find(k => DRAW_TOOLS[k].code === e.code);
+    if (tool) { e.preventDefault(); e.stopPropagation(); setDrawTool(_drawState.tool === tool ? 'cursor' : tool); }
+  }
+}, true);
+
+// ---------------------------------------------------------------------------
+// Mouse
+// ---------------------------------------------------------------------------
+function _overlayXY(e) {
+  const r = getOverlay().getBoundingClientRect();
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+
+function startDraft(e) {
+  const { x, y } = _overlayXY(e);
+  const tp = pxToTimePrice(x, y, { snap: true });
+  if (!tp) return;
+  const kind = _drawState.tool;
+  const label = document.getElementById('drawLabel')?.value.trim() || null;
+  _drawState.measure = null;
+  if (DRAW_TOOLS[kind].pts === 1) {
+    _drawState.drafting = { kind, points: [tp], label: kind === 'text' ? (label || 'Note') : label, color: _drawState.color, width: _drawState.width, lineStyle: _drawState.lineStyle };
+    commitDraft();
+    return;
+  }
+  _drawState.drafting = { kind, points: [tp, { ...tp }], label, color: _drawState.color, width: _drawState.width, lineStyle: _drawState.lineStyle, _startXY: { x, y }, _clickMode: false };
+  renderOverlay();
+}
+
+function onOverlayMouseDown(e) {
+  if (e.button !== 0) return;
+  const target = e.target;
+
+  // Second click of a click-click drawing
+  if (_drawState.drafting && _drawState.drafting._clickMode) {
+    e.preventDefault(); e.stopPropagation();
+    finishDraft();
+    return;
+  }
+
+  // Handle on the selected drawing
+  if (target?.classList?.contains('draw-handle')) {
+    e.preventDefault(); e.stopPropagation();
+    const id = parseInt(target.dataset.drawId, 10);
+    const d = _drawState.drawings.find(x => x.id === id);
+    if (!d) return;
+    _editDrag = { id, mode: 'handle', handleIdx: target.dataset.handleIdx, before: _snapshot(d) };
+    return;
+  }
+
+  // Body of an existing drawing (cursor tool) → select + start move
+  const idAttr = target?.dataset?.drawId;
+  if (_drawState.tool === 'cursor' && idAttr) {
+    e.preventDefault(); e.stopPropagation();
+    const id = parseInt(idAttr, 10);
+    const d = _drawState.drawings.find(x => x.id === id);
+    selectDrawing(id);
+    const { x, y } = _overlayXY(e);
+    const logical = _activeChart?.timeScale().coordinateToLogical(x);
+    const price = _activeSeries?.coordinateToPrice(y);
+    if (d && logical != null && price != null) {
+      _editDrag = { id, mode: 'body', before: _snapshot(d), startLogical: Math.round(logical), startPrice: price };
+    }
+    return;
+  }
+
+  if (_drawState.tool === 'cursor') {
+    if (_drawState.selectedId !== null) deselectDrawing();
+    if (_drawState.measure) { _drawState.measure = null; renderOverlay(); }
+    return;
+  }
+
+  e.preventDefault(); e.stopPropagation();
+  startDraft(e);
+}
+
+function onOverlayMouseMove(e) {
+  const overlay = getOverlay();
+  if (!overlay) return;
+
+  if (_editDrag) {
+    const { x, y } = _overlayXY(e);
+    const d = _drawState.drawings.find(z => z.id === _editDrag.id);
+    if (!d) return;
+    if (_editDrag.mode === 'handle') {
+      const tp = pxToTimePrice(x, y, { snap: true });
+      if (!tp) return;
+      applyHandleDrag(d, _editDrag.handleIdx, tp);
+    } else {
+      const logical = _activeChart.timeScale().coordinateToLogical(x);
+      const price = _activeSeries.coordinateToPrice(y);
+      if (logical == null || price == null) return;
+      const dIdx = Math.round(logical) - _editDrag.startLogical;
+      const dPrice = price - _editDrag.startPrice;
+      d.points = _editDrag.before.points.map(p => {
+        const l = logicalOfTime(p.time);
+        return { time: l == null ? p.time : timeOfLogical(Math.round(l) + dIdx), price: p.price + dPrice };
+      });
+    }
+    renderOverlay();
+    return;
+  }
+
+  // Only react to moves over the chart for drafting / hover previews
+  if (!overlay.classList.contains('active')) return;
+  const { x, y } = _overlayXY(e);
+  const tp = pxToTimePrice(x, y, { snap: true });
+  if (!tp) return;
+  const dr = _drawState.drafting;
+  if (dr) {
+    if (!dr._clickMode && e.buttons === 0) dr._clickMode = true;   // released without moving → click-click mode
+    dr.points[1] = tp;
+    renderOverlay();
+  } else if (DRAW_TOOLS[_drawState.tool]?.pts === 1) {
+    _drawState.hover = tp;
+    renderOverlay();
+  }
+}
+
+function onOverlayMouseUp(e) {
+  if (_editDrag) {
+    const d = _drawState.drawings.find(x => x.id === _editDrag.id);
+    const before = _editDrag.before;
+    _editDrag = null;
+    if (d && JSON.stringify(before.points) !== JSON.stringify(d.points)) {
+      pushUndo({ type: 'update', id: d.id, before });
+      patchDrawing(d.id, { points: d.points }).catch(err => {
+        showToast('Save failed: ' + err.message, 'error');
+        d.points = before.points; renderOverlay();
+      });
+    }
+    return;
+  }
+  const dr = _drawState.drafting;
+  if (!dr || dr._clickMode) return;
+  const { x, y } = _overlayXY(e);
+  if (Math.hypot(x - dr._startXY.x, y - dr._startXY.y) < 5) {
+    dr._clickMode = true;           // it was a click: keep drawing until the next click
+    return;
+  }
+  finishDraft();
+}
+
+function finishDraft() {
+  const dr = _drawState.drafting;
+  if (!dr) return;
+  const a = timePriceToPx(dr.points[0].time, dr.points[0].price);
+  const b = timePriceToPx(dr.points[1].time, dr.points[1].price);
+  if (a && b && Math.hypot(b.x - a.x, b.y - a.y) < 4) { _drawState.drafting = null; renderOverlay(); return; }
+  commitDraft();
+}
+
+// Handle indices: numbers map to points; rect corners 'c2' / 'c3' are the
+// two synthetic corners (p0.time, p1.price) and (p1.time, p0.price).
+function applyHandleDrag(d, idx, tp) {
+  const p = d.points;
+  if (d.kind === 'rect' && idx === 'c2') { p[0] = { time: tp.time, price: p[0].price }; p[1] = { time: p[1].time, price: tp.price }; return; }
+  if (d.kind === 'rect' && idx === 'c3') { p[1] = { time: tp.time, price: p[1].price }; p[0] = { time: p[0].time, price: tp.price }; return; }
+  const i = parseInt(idx, 10);
+  if (d.kind === 'position') {
+    if (i === 0) p[0] = { time: tp.time, price: tp.price };
+    if (i === 1) { p[1] = { time: tp.time, price: tp.price }; p[2] = { ...p[2], time: tp.time }; }
+    if (i === 2) p[2] = { time: p[1].time, price: tp.price };
+    return;
+  }
+  if (d.kind === 'hline') { p[0] = { time: p[0].time, price: tp.price }; return; }
+  p[i] = { time: tp.time, price: tp.price };
+}
+
+async function commitDraft() {
+  const d = _drawState.drafting;
+  if (!d) return;
+  _drawState.drafting = null;
+
+  if (d.kind === 'measure') {                 // transient: shown until next click / Esc
+    _drawState.measure = { points: d.points };
+    if (_drawState._quickMeasure) { _drawState._quickMeasure = false; setDrawTool('cursor'); }
+    else if (!_drawState.lock) setDrawTool('cursor');
+    renderOverlay();
+    return;
+  }
+  if (d.kind === 'position') {                // default target = 2R on the other side of entry
+    const entry = d.points[0].price, stop = d.points[1].price;
+    if (!entry || Math.abs(entry - stop) / entry < 0.001) {
+      showToast('Drag up or down from the entry to set the stop.', 'info');
+      renderOverlay();
+      return;
+    }
+    d.points[2] = { time: d.points[1].time, price: entry + 2 * (entry - stop) };
+  }
+  const rec = { kind: d.kind, points: d.points.map(({ time, price }) => ({ time, price })), label: d.label, color: d.color,
+                width: LINE_KINDS.has(d.kind) ? (d.width || 0) : 0, lineStyle: LINE_KINDS.has(d.kind) ? (d.lineStyle || '') : '' };
+  if (!_drawState.lock) setDrawTool('cursor'); else renderOverlay();
+  try {
+    const id = await saveDrawing(rec);
+    _drawState.drawings.push({ id, ...rec });
+    pushUndo({ type: 'add', id });
+    const lbl = document.getElementById('drawLabel');
+    if (lbl) lbl.value = '';
+    if (rec.kind === 'text') {
+      selectDrawing(id);
+      setTimeout(() => { const n = document.getElementById('dpName'); if (n) { n.focus(); n.select(); } }, 0);
+    }
+  } catch (err) {
+    showToast('Save drawing failed: ' + err.message, 'error');
+  }
+  renderOverlay();
+}
+
+function onOverlayContextMenu(e) {
+  const id = parseInt(e.target?.dataset?.drawId, 10);
+  if (isNaN(id)) {
+    if (_drawState.tool !== 'cursor') { e.preventDefault(); setDrawTool('cursor'); }   // right-click cancels a tool
+    return;
+  }
+  e.preventDefault();
+  removeDrawings([id]);
+}
+
+// ---------------------------------------------------------------------------
+// Selection + edit popover
+// ---------------------------------------------------------------------------
+function selectDrawing(id) {
+  _drawState.selectedId = id;
+  renderOverlay();
+  showEditPopover(id);
+}
+function deselectDrawing(render = true) {
+  _drawState.selectedId = null;
+  hideEditPopover();
+  if (render) renderOverlay();
+}
+
 function showEditPopover(id) {
-  const drawing = _drawState.drawings.find(d => d.id === id);
-  if (!drawing) return;
+  const d = _drawState.drawings.find(x => x.id === id);
+  if (!d) return;
   let pop = document.getElementById('drawEditPopover');
   if (!pop) {
     pop = document.createElement('div');
@@ -4272,38 +4798,48 @@ function showEditPopover(id) {
     pop.className = 'draw-edit-popover';
     document.getElementById('detailChart').appendChild(pop);
   }
+  const noLabel = d.kind === 'position';
   pop.innerHTML = `
-    <input type="text" id="dpName" placeholder="Name…" value="${(drawing.label || '').replace(/"/g, '&quot;')}">
-    <input type="color" id="dpColor" value="${drawing.color || '#2563eb'}">
-    <button id="dpSave">Save</button>
-    <button id="dpDel" class="del" title="Delete drawing">×</button>
-  `;
+    <span class="pop-kind">${drawIcon(d.kind, 14)}</span>
+    ${noLabel ? '' : `<input type="text" id="dpName" placeholder="${d.kind === 'text' ? 'Note text' : 'Label'}" maxlength="60" value="${esc(d.label || '')}">`}
+    <span class="hud-swatches">${colorSwatches(d.color, 'data-pop-color')}</span>
+    ${LINE_KINDS.has(d.kind) ? linePickers(d.kind, lineOf(d), 'data-pop') : ''}
+    <button class="pop-btn" id="dpDel" title="Delete (Del)" aria-label="Delete drawing"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg></button>`;
   pop.style.display = 'flex';
   positionEditPopover();
 
-  document.getElementById('dpSave').addEventListener('click', async () => {
-    const newName = document.getElementById('dpName').value.trim();
-    const newColor = document.getElementById('dpColor').value;
-    drawing.label = newName || null;
-    drawing.color = newColor;
+  const commit = async (fields) => {
+    const before = _snapshot(d);
+    const patch = {};
+    if (fields.label !== undefined) { d.label = fields.label; patch.name = fields.label || ''; }
+    if (fields.color) { d.color = fields.color; patch.color = fields.color; }
+    if (fields.width !== undefined) { d.width = fields.width; patch.line_width = fields.width; }
+    if (fields.lineStyle !== undefined) { d.lineStyle = fields.lineStyle; patch.line_style = fields.lineStyle; }
+    renderOverlay();
     try {
-      await patchDrawing(id, { name: newName, color: newColor });
-      renderOverlay();
-      hideEditPopover();
-      _drawState.selectedId = null;
-      renderOverlay();
+      await patchDrawing(id, patch);
+      pushUndo({ type: 'update', id, before });
     } catch (e) { showToast('Save failed: ' + e.message, 'error'); }
-  });
-  document.getElementById('dpDel').addEventListener('click', async () => {
-    if (!(await confirmDialog('', { title: 'Delete this drawing?', confirmLabel: 'Delete', danger: true }))) return;
-    try {
-      await deleteDrawingApi(id);
-      _drawState.drawings = _drawState.drawings.filter(d => d.id !== id);
-      _drawState.selectedId = null;
-      hideEditPopover();
-      renderOverlay();
-    } catch (e) { showToast('Delete failed: ' + e.message, 'error'); }
-  });
+  };
+  pop.querySelectorAll('[data-pop-width]').forEach(b => b.addEventListener('click', () => {
+    pop.querySelectorAll('[data-pop-width]').forEach(x => x.classList.toggle('on', x === b));
+    commit({ width: Number(b.dataset.popWidth) });
+  }));
+  pop.querySelectorAll('[data-pop-style]').forEach(b => b.addEventListener('click', () => {
+    pop.querySelectorAll('[data-pop-style]').forEach(x => x.classList.toggle('on', x === b));
+    commit({ lineStyle: b.dataset.popStyle });
+  }));
+  pop.querySelectorAll('[data-pop-color]').forEach(b => b.addEventListener('click', () => {
+    pop.querySelectorAll('[data-pop-color]').forEach(x => x.classList.toggle('on', x === b));
+    commit({ color: b.dataset.popColor });
+  }));
+  const name = pop.querySelector('#dpName');
+  if (name) {
+    const save = () => { const v = name.value.trim() || null; if (v !== (d.label || null)) commit({ label: v }); };
+    name.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); save(); name.blur(); } });
+    name.addEventListener('blur', save);
+  }
+  pop.querySelector('#dpDel').addEventListener('click', () => removeDrawings([id]));
 }
 
 function hideEditPopover() {
@@ -4313,218 +4849,244 @@ function hideEditPopover() {
 
 function positionEditPopover() {
   const pop = document.getElementById('drawEditPopover');
-  if (!pop || _drawState.selectedId === null) return;
-  const drawing = _drawState.drawings.find(d => d.id === _drawState.selectedId);
-  if (!drawing) return;
-  const p = drawing.points[0];
-  const px = timePriceToPx(p.time, p.price);
-  if (!px) return;
-  // Position above the first point
-  const host = document.getElementById('detailChart');
-  const hostRect = host.getBoundingClientRect();
-  const popH = pop.offsetHeight || 44;
-  let top = px.y - popH - 8;
-  if (top < 4) top = px.y + 14;
-  let left = Math.max(8, Math.min(hostRect.width - 280, px.x - 100));
+  if (!pop || pop.style.display === 'none' || _drawState.selectedId === null) return;
+  const d = _drawState.drawings.find(x => x.id === _drawState.selectedId);
+  if (!d) return;
+  const pts = d.points.map(p => timePriceToPx(p.time, p.price)).filter(Boolean);
+  if (!pts.length) return;
+  const { pw, ph } = paneSize();
+  const minY = Math.min(...pts.map(p => p.y)), maxY = Math.max(...pts.map(p => p.y));
+  const cx = d.kind === 'hline' ? pw / 2 : pts.reduce((s, p) => s + p.x, 0) / pts.length;
+  const popW = pop.offsetWidth || 300, popH = pop.offsetHeight || 36;
+  let top = minY - popH - 12;
+  if (top < 36) top = Math.min(maxY + 14, ph - popH - 4);
+  const left = Math.max(8, Math.min(pw - popW - 8, cx - popW / 2));
   pop.style.top = `${top}px`;
   pop.style.left = `${left}px`;
 }
 
-async function commitDraft() {
-  const d = _drawState.drafting;
-  if (!d) return;
-  _drawState.drafting = null;
-  try {
-    const id = await saveDrawing({
-      kind: d.kind, points: d.points, label: d.label, color: d.color,
-    });
-    _drawState.drawings.push({ id, ...d });
-    document.getElementById('drawLabel').value = '';
-  } catch (err) {
-    showToast('Save drawing failed: ' + err.message, 'error');
-  }
-  renderOverlay();
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+function escapeText(s) {
+  return String(s).replace(/[<>&"']/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&#39;' })[c]);
+}
+function _fmtP(v) {
+  const a = Math.abs(v);
+  return v.toLocaleString('en-IN', { minimumFractionDigits: a < 100 ? 2 : 1, maximumFractionDigits: a < 100 ? 2 : 1 });
+}
+// Readable text colour on top of a filled tag
+function _onColor(hex) {
+  const m = String(hex).replace('#', '');
+  if (m.length < 6) return '#fff';
+  const [r, g, b] = [0, 2, 4].map(i => parseInt(m.slice(i, i + 2), 16) / 255);
+  return (0.299 * r + 0.587 * g + 0.114 * b) > 0.6 ? '#111' : '#fff';
+}
+function _tag(x, y, text, bg, anchor = 'start') {
+  const w = text.length * 6.4 + 10;
+  const rx = anchor === 'end' ? x - w : (anchor === 'middle' ? x - w / 2 : x);
+  return `<g class="draw-tag" pointer-events="none"><rect x="${rx}" y="${y - 9}" width="${w}" height="18" rx="3" fill="${bg}"/>
+    <text x="${rx + 5}" y="${y + 4}" fill="${_onColor(bg)}" font-family="IBM Plex Mono, monospace" font-size="11" font-weight="500">${escapeText(text)}</text></g>`;
+}
+function _lbl(x, y, text, color, anchor = 'start') {
+  return `<text x="${x}" y="${y}" fill="${color}" text-anchor="${anchor}" font-family="IBM Plex Sans, sans-serif" font-size="12" font-weight="600" paint-order="stroke" stroke-width="3" style="stroke:var(--chart-bg)" pointer-events="none">${escapeText(text)}</text>`;
 }
 
-// --- SVG render -----------------------------------------------------------
 function renderOverlay() {
   const svg = getOverlay();
   if (!svg) return;
-  const host = document.getElementById('detailChart');
-  if (!host) return;
-  const w = host.clientWidth, h = host.clientHeight;
+  const { w, h, pw, ph } = paneSize();
   svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
   svg.setAttribute('width', w);
   svg.setAttribute('height', h);
+  const ctx = { w, h, pw, ph };
 
-  const all = [..._drawState.drawings];
-  if (_drawState.drafting) all.push({ ..._drawState.drafting, id: '__draft__' });
-
-  let html = '';
-  for (const d of all) {
-    const isSelected = d.id === _drawState.selectedId;
-    html += renderShape(d, w, h, isSelected);
+  let body = '';
+  if (!_drawState.hidden) {
+    for (const d of _drawState.drawings) body += renderShape(d, ctx, d.id === _drawState.selectedId);
   }
-  // Selection handles last so they paint on top
-  if (_drawState.selectedId !== null) {
+  if (_drawState.drafting) body += renderShape({ ..._drawState.drafting, id: '__draft__' }, ctx, false);
+  if (_drawState.measure) body += renderShape({ kind: 'measure', points: _drawState.measure.points, id: '__draft__' }, ctx, false);
+  // 1-point tool preview under the mouse
+  if (_drawState.hover && !_drawState.drafting && DRAW_TOOLS[_drawState.tool]?.pts === 1) {
+    body += `<g opacity="0.55">${renderShape({ kind: _drawState.tool === 'text' ? 'hray' : _drawState.tool, points: [_drawState.hover], color: _drawState.color, width: _drawState.width, lineStyle: _drawState.lineStyle, id: '__draft__' }, ctx, false)}</g>`;
+  }
+  let handles = '';
+  if (_drawState.selectedId !== null && !_drawState.hidden) {
     const sel = _drawState.drawings.find(d => d.id === _drawState.selectedId);
-    if (sel) html += renderHandles(sel);
+    if (sel) handles = renderHandles(sel, ctx);
   }
-  svg.innerHTML = html;
+  svg.innerHTML = `<defs><clipPath id="drawPane"><rect x="0" y="0" width="${Math.max(0, pw)}" height="${Math.max(0, ph)}"/></clipPath></defs>
+    <g clip-path="url(#drawPane)">${body}</g>${handles}`;
   positionEditPopover();
 }
 
-function renderShape(d, w, h, isSelected) {
-  const stroke = d.color || '#2563eb';
-  const fill = `${stroke}22`;
+function renderShape(d, ctx, isSelected) {
+  const { pw } = ctx;
+  const stroke = d.color || DRAW_COLORS[0];
   const idAttr = d.id !== '__draft__' ? `data-draw-id="${d.id}"` : '';
-  const selClass = isSelected ? 'selected' : '';
-  const strokeW = isSelected ? 2.5 : 1.5;
+  const sel = isSelected ? 'selected' : '';
+  const ln = lineOf(d);
+  const sw = ln.width + (isSelected ? 0.8 : 0);
+  const dash = dashFor(ln.style, ln.width);
+  const P = i => d.points[i] ? timePriceToPx(d.points[i].time, d.points[i].price) : null;
+  // Invisible fat line so thin strokes are easy to click
+  const hit = (x1, y1, x2, y2) => `<line ${idAttr} class="draw-hit ${sel}" x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="transparent" stroke-width="14" pointer-events="stroke" style="cursor:move"/>`;
 
-  if (d.kind === 'rect' && d.points.length === 2) {
-    const a = timePriceToPx(d.points[0].time, d.points[0].price);
-    const b = timePriceToPx(d.points[1].time, d.points[1].price);
+  if (d.kind === 'rect') {
+    const a = P(0), b = P(1);
     if (!a || !b) return '';
-    const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y);
-    const rw = Math.abs(b.x - a.x), rh = Math.abs(b.y - a.y);
-    return `
-      <rect ${idAttr} class="${selClass}" x="${x}" y="${y}" width="${rw}" height="${rh}"
-            fill="${fill}" stroke="${stroke}" stroke-width="${strokeW}" style="cursor:pointer; color:${stroke}"/>
-      ${d.label ? `<text x="${x + 6}" y="${y + 14}" fill="${stroke}" font-family="Inter, sans-serif" font-size="11" font-weight="600" pointer-events="none">${escapeText(d.label)}</text>` : ''}
-    `;
+    const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y), rw = Math.abs(b.x - a.x), rh = Math.abs(b.y - a.y);
+    const hiP = Math.max(d.points[0].price, d.points[1].price), loP = Math.min(d.points[0].price, d.points[1].price);
+    const pct = loP ? ((hiP - loP) / loP * 100) : 0;
+    return `<rect ${idAttr} class="${sel}" x="${x}" y="${y}" width="${rw}" height="${rh}" fill="${stroke}" fill-opacity="0.12"
+              stroke="${stroke}" stroke-width="${sw}" ${dash} style="cursor:move; color:${stroke}"/>
+      ${d.label ? _lbl(x + 6, y + 15, d.label, stroke) : ''}
+      ${isSelected || d.id === '__draft__' ? _tag(x + rw, y + rh + 12, `${_fmtP(loP)} – ${_fmtP(hiP)} · ${pct.toFixed(1)}%`, stroke, 'end') : ''}`;
   }
 
-  if (d.kind === 'hline' && d.points.length >= 1) {
-    const p = timePriceToPx(d.points[0].time, d.points[0].price);
-    if (!p) return '';
-    return `
-      <line ${idAttr} class="${selClass}" x1="0" y1="${p.y}" x2="${w}" y2="${p.y}"
-            stroke="${stroke}" stroke-width="${strokeW}" stroke-dasharray="6 3" style="cursor:pointer; color:${stroke}"/>
-      ${d.label ? `<rect x="6" y="${p.y - 8}" width="${d.label.length * 7 + 10}" height="16" fill="${stroke}" rx="2" pointer-events="none"/><text x="11" y="${p.y + 4}" fill="white" font-family="Inter, sans-serif" font-size="11" font-weight="600" pointer-events="none">${escapeText(d.label)} · ${d.points[0].price.toFixed(2)}</text>` : `<text x="6" y="${p.y - 4}" fill="${stroke}" font-family="JetBrains Mono, monospace" font-size="10" pointer-events="none">${d.points[0].price.toFixed(2)}</text>`}
-    `;
+  if (d.kind === 'hline' || d.kind === 'hray') {
+    const a = P(0);
+    if (!a) return '';
+    const x1 = d.kind === 'hline' ? 0 : a.x;
+    return `${hit(x1, a.y, pw, a.y)}
+      <line x1="${x1}" y1="${a.y}" x2="${pw}" y2="${a.y}" stroke="${stroke}" stroke-width="${sw}" ${dash} pointer-events="none"/>
+      ${d.kind === 'hray' ? `<circle cx="${a.x}" cy="${a.y}" r="3" fill="${stroke}" pointer-events="none"/>` : ''}
+      ${d.label ? _lbl(x1 + (d.kind === 'hline' ? 8 : 10), a.y - 6, d.label, stroke) : ''}
+      ${_tag(pw - 2, a.y, _fmtP(d.points[0].price), stroke, 'end')}`;
   }
 
-  if (d.kind === 'fib' && d.points.length === 2) {
-    const a = timePriceToPx(d.points[0].time, d.points[0].price);
-    const b = timePriceToPx(d.points[1].time, d.points[1].price);
+  if (d.kind === 'trend' || d.kind === 'arrow' || d.kind === 'ray') {
+    const a = P(0), b = P(1);
     if (!a || !b) return '';
-    // Standard Fibonacci retracement levels
-    const levels = [
-      { ratio: 0.000, label: '0%',    color: '#6b7280' },
-      { ratio: 0.236, label: '23.6%', color: '#22c55e' },
-      { ratio: 0.382, label: '38.2%', color: '#eab308' },
-      { ratio: 0.500, label: '50%',   color: '#f97316' },
-      { ratio: 0.618, label: '61.8%', color: '#ef4444' },  // Golden ratio — most important
-      { ratio: 0.786, label: '78.6%', color: '#a855f7' },
-      { ratio: 1.000, label: '100%',  color: '#6b7280' },
-    ];
-    const xMin = Math.min(a.x, b.x);
-    const xMax = Math.max(a.x, b.x);
-    // Price extremes
-    const pHigh = Math.max(d.points[0].price, d.points[1].price);
-    const pLow = Math.min(d.points[0].price, d.points[1].price);
-
-    let levelLines = '';
-    for (const lv of levels) {
-      const levelPrice = pHigh - (pHigh - pLow) * lv.ratio;
-      const px = timePriceToPx(d.points[0].time, levelPrice);
-      if (!px) continue;
-      const y = px.y;
-      const isGolden = lv.ratio === 0.618;
-      const lineColor = isSelected ? stroke : lv.color;
-      levelLines += `
-        <line x1="${xMin}" y1="${y}" x2="${w}" y2="${y}"
-              stroke="${lineColor}" stroke-width="${isGolden ? 1.5 : 1}" stroke-dasharray="4 3"
-              opacity="0.7" pointer-events="none"/>
-        <rect x="${w - 90}" y="${y - 8}" width="84" height="14" fill="${lineColor}" rx="2" opacity="0.85" pointer-events="none"/>
-        <text x="${w - 86}" y="${y + 3}" fill="white" font-family="JetBrains Mono, monospace" font-size="10" font-weight="${isGolden ? '700' : '500'}" pointer-events="none">${lv.label} · ${levelPrice.toFixed(1)}</text>
-      `;
+    let bx = b.x, by = b.y;
+    if (d.kind === 'ray' && Math.abs(b.x - a.x) > 0.5) {        // extend to the pane edge
+      const dir = b.x > a.x ? 1 : -1, edge = dir > 0 ? pw : 0;
+      by = a.y + (b.y - a.y) * (edge - a.x) / (b.x - a.x); bx = edge;
     }
-
-    return `
-      <g ${idAttr} class="${selClass}" style="color:${stroke}">
-        <line x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"
-              stroke="${stroke}" stroke-width="${isSelected ? 2 : 1.2}"
-              style="cursor:pointer" pointer-events="stroke"/>
-        ${levelLines}
-        ${d.label ? `<text x="${a.x + 4}" y="${a.y - 4}" fill="${stroke}" font-family="Inter, sans-serif" font-size="11" font-weight="600" pointer-events="none">${escapeText(d.label)}</text>` : ''}
-      </g>
-    `;
+    const mid = `arr-${String(d.id).replace(/\W/g, '')}-${stroke.replace('#', '')}`;
+    const marker = d.kind === 'arrow' ? `marker-end="url(#${mid})"` : '';
+    const defs = d.kind === 'arrow' ? `<defs><marker id="${mid}" viewBox="0 0 10 10" refX="8" refY="5" markerUnits="userSpaceOnUse" markerWidth="${9 + ln.width * 2.5}" markerHeight="${9 + ln.width * 2.5}" orient="auto-start-reverse"><path d="M0 0 10 5 0 10z" fill="${stroke}"/></marker></defs>` : '';
+    const chg = d.points[0].price ? (d.points[1].price - d.points[0].price) / d.points[0].price * 100 : 0;
+    const la = logicalOfTime(d.points[0].time), lb = logicalOfTime(d.points[1].time);
+    const bars = (la != null && lb != null) ? Math.round(Math.abs(lb - la)) : null;
+    return `${defs}${hit(a.x, a.y, bx, by)}
+      <line x1="${a.x}" y1="${a.y}" x2="${bx}" y2="${by}" stroke="${stroke}" stroke-width="${sw}" stroke-linecap="round" ${dash} pointer-events="none" ${marker}/>
+      ${d.label ? _lbl((a.x + b.x) / 2, (a.y + b.y) / 2 - 8, d.label, stroke, 'middle') : ''}
+      ${(isSelected || d.id === '__draft__') && d.kind !== 'arrow' ? _tag(b.x + 8, b.y, `${chg >= 0 ? '+' : ''}${chg.toFixed(2)}%${bars != null ? ` · ${bars} bars` : ''}`, stroke) : ''}`;
   }
 
-  if ((d.kind === 'trend' || d.kind === 'arrow') && d.points.length === 2) {
-    const a = timePriceToPx(d.points[0].time, d.points[0].price);
-    const b = timePriceToPx(d.points[1].time, d.points[1].price);
+  if (d.kind === 'fib') {
+    const a = P(0), b = P(1);
     if (!a || !b) return '';
-    const arrowMarker = d.kind === 'arrow' ? `marker-end="url(#draw-arrow-${stroke.replace('#','')})"` : '';
-    const defs = d.kind === 'arrow' ? `
-      <defs>
-        <marker id="draw-arrow-${stroke.replace('#','')}" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-          <path d="M 0 0 L 10 5 L 0 10 z" fill="${stroke}"/>
-        </marker>
-      </defs>` : '';
-    const lblX = (a.x + b.x) / 2, lblY = (a.y + b.y) / 2;
-    return `
-      ${defs}
-      <line ${idAttr} class="draw-hit ${selClass}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"
-            stroke="transparent" stroke-width="14" style="cursor:pointer" pointer-events="stroke"/>
-      <line x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"
-            stroke="${stroke}" stroke-width="${isSelected ? 2.8 : 2}" style="color:${stroke}; pointer-events:none" ${arrowMarker}/>
-      ${d.label ? `<text x="${lblX}" y="${lblY - 6}" fill="${stroke}" font-family="Inter, sans-serif" font-size="11" font-weight="600" text-anchor="middle" pointer-events="none">${escapeText(d.label)}</text>` : ''}
-    `;
+    const levels = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1];
+    const pHigh = Math.max(d.points[0].price, d.points[1].price), pLow = Math.min(d.points[0].price, d.points[1].price);
+    const xMin = Math.min(a.x, b.x);
+    let out = '';
+    levels.forEach((r, i) => {
+      const price = pHigh - (pHigh - pLow) * r;
+      const y = _activeSeries.priceToCoordinate(price);
+      if (y == null) return;
+      const key = r === 0.5 || r === 0.618;
+      // Shade the 0.5–0.618 "golden pocket"
+      if (r === 0.5) {
+        const y2 = _activeSeries.priceToCoordinate(pHigh - (pHigh - pLow) * 0.618);
+        if (y2 != null) out += `<rect x="${xMin}" y="${Math.min(y, y2)}" width="${pw - xMin}" height="${Math.abs(y2 - y)}" fill="${stroke}" fill-opacity="0.10" pointer-events="none"/>`;
+      }
+      out += `<line x1="${xMin}" y1="${y}" x2="${pw}" y2="${y}" stroke="${stroke}" stroke-width="${(key ? 1.4 : 1) * Math.max(1, ln.width / 1.5)}" stroke-opacity="${key ? 0.95 : 0.55}" ${r === 0 || r === 1 ? '' : 'stroke-dasharray="4 3"'} pointer-events="none"/>`;
+      out += `<text x="${xMin + 4}" y="${y - 4}" fill="${stroke}" font-family="IBM Plex Mono, monospace" font-size="10.5" font-weight="${key ? 600 : 400}" paint-order="stroke" stroke-width="3" style="stroke:var(--chart-bg)" pointer-events="none">${(r * 100).toFixed(r === 0.5 || r === 0 || r === 1 ? 0 : 1)}% · ${_fmtP(price)}</text>`;
+    });
+    return `<g style="color:${stroke}">${hit(a.x, a.y, b.x, b.y)}
+      <line x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" stroke="${stroke}" stroke-width="${sw}" ${dash} pointer-events="none"/>
+      ${out}${d.label ? _lbl(a.x + 4, a.y - 18, d.label, stroke) : ''}</g>`;
   }
 
+  if (d.kind === 'text') {
+    const a = P(0);
+    if (!a) return '';
+    const text = d.label || 'Note';
+    const tw = text.length * 7 + 16;
+    return `<g ${idAttr} class="${sel}" style="cursor:move; color:${stroke}">
+      <rect ${idAttr} x="${a.x}" y="${a.y - 13}" width="${tw}" height="24" rx="4" style="fill:var(--chart-bg)" fill-opacity="0.92" stroke="${stroke}" stroke-width="${isSelected ? 1.8 : 1}"/>
+      <text ${idAttr} x="${a.x + 8}" y="${a.y + 4}" fill="${stroke}" font-family="IBM Plex Sans, sans-serif" font-size="12" font-weight="600">${escapeText(text)}</text></g>`;
+  }
+
+  if (d.kind === 'position') {
+    const e0 = P(0), s1 = P(1);
+    if (!e0 || !s1) return '';
+    const entry = d.points[0].price, stop = d.points[1].price;
+    const target = d.points[2] ? d.points[2].price : entry + 2 * (entry - stop);
+    const tY = _activeSeries.priceToCoordinate(target);
+    if (tY == null) return '';
+    const long = stop < entry;
+    const x = Math.min(e0.x, s1.x), wd = Math.max(24, Math.abs(s1.x - e0.x));
+    const risk = Math.abs(entry - stop), reward = Math.abs(target - entry);
+    const rr = risk ? reward / risk : 0;
+    const pos = getComputedStyle(document.body).getPropertyValue('--pos').trim() || '#22a06b';
+    const neg = getComputedStyle(document.body).getPropertyValue('--neg').trim() || '#e5484d';
+    const pct = v => `${((v - entry) / entry * 100) >= 0 ? '+' : ''}${((v - entry) / entry * 100).toFixed(2)}%`;
+    return `<g ${idAttr} class="${sel}" style="cursor:move">
+      <rect ${idAttr} x="${x}" y="${Math.min(e0.y, tY)}" width="${wd}" height="${Math.abs(tY - e0.y)}" fill="${pos}" fill-opacity="0.16" stroke="${pos}" stroke-opacity="${isSelected ? 0.9 : 0.4}"/>
+      <rect ${idAttr} x="${x}" y="${Math.min(e0.y, s1.y)}" width="${wd}" height="${Math.abs(s1.y - e0.y)}" fill="${neg}" fill-opacity="0.16" stroke="${neg}" stroke-opacity="${isSelected ? 0.9 : 0.4}"/>
+      <line x1="${x}" y1="${e0.y}" x2="${x + wd}" y2="${e0.y}" style="stroke:var(--text-dim)" stroke-width="1.2" pointer-events="none"/></g>
+      ${_tag(x + wd / 2, tY + (long ? -13 : 13), `Target ${_fmtP(target)} ${pct(target)}`, pos, 'middle')}
+      ${_tag(x + wd / 2, s1.y + (long ? 13 : -13), `Stop ${_fmtP(stop)} ${pct(stop)}`, neg, 'middle')}
+      ${_tag(x + 4, e0.y, `${long ? 'Long' : 'Short'} ${_fmtP(entry)} · ${rr.toFixed(2)}R`, stroke)}`;
+  }
+
+  if (d.kind === 'measure') {
+    const a = P(0), b = P(1);
+    if (!a || !b) return '';
+    const p0 = d.points[0].price, p1 = d.points[1].price;
+    const diff = p1 - p0, pct = p0 ? diff / p0 * 100 : 0;
+    const la = logicalOfTime(d.points[0].time), lb = logicalOfTime(d.points[1].time);
+    const bars = (la != null && lb != null) ? Math.round(lb - la) : 0;
+    const col = diff >= 0 ? (getComputedStyle(document.body).getPropertyValue('--pos').trim() || '#22a06b')
+                          : (getComputedStyle(document.body).getPropertyValue('--neg').trim() || '#e5484d');
+    const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y);
+    return `<rect x="${x}" y="${y}" width="${Math.abs(b.x - a.x)}" height="${Math.abs(b.y - a.y)}" fill="${col}" fill-opacity="0.13" pointer-events="none"/>
+      <line x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" stroke="${col}" stroke-width="1.4" stroke-dasharray="4 3" pointer-events="none"/>
+      ${_tag((a.x + b.x) / 2, (diff >= 0 ? y - 14 : y + Math.abs(b.y - a.y) + 14), `${diff >= 0 ? '+' : ''}${_fmtP(diff)} (${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%) · ${Math.abs(bars)} bars`, col, 'middle')}`;
+  }
   return '';
 }
 
 function renderHandles(d) {
-  // Render small circles at each control point so user can drag-resize.
-  // For rect: 4 corners. For hline: 1 mid handle. For trend/arrow: 2 endpoints.
+  const P = i => d.points[i] ? timePriceToPx(d.points[i].time, d.points[i].price) : null;
   let pts = [];
-  if (d.kind === 'rect' && d.points.length === 2) {
-    const a = timePriceToPx(d.points[0].time, d.points[0].price);
-    const b = timePriceToPx(d.points[1].time, d.points[1].price);
+  if (d.kind === 'rect') {
+    const a = P(0), b = P(1);
     if (!a || !b) return '';
-    // Map back to time/price for the 4 corners using the original points
-    pts = [
-      { px: a, idx: 0 },
-      { px: b, idx: 1 },
-      // For 4-corner support we'd need to track all 4; with 2 points (opposite
-      // corners) we let the user drag either of the 2 stored corners.
-    ];
-  } else if (d.kind === 'hline' && d.points.length >= 1) {
-    const a = timePriceToPx(d.points[0].time, d.points[0].price);
+    pts = [{ x: a.x, y: a.y, i: 0 }, { x: b.x, y: b.y, i: 1 }, { x: a.x, y: b.y, i: 'c2' }, { x: b.x, y: a.y, i: 'c3' }];
+  } else if (d.kind === 'hline') {
+    const a = P(0);
     if (!a) return '';
-    // One handle in the middle of the visible chart at this price
-    const host = document.getElementById('detailChart');
-    pts = [{ px: { x: host.clientWidth / 2, y: a.y }, idx: 0 }];
-  } else if ((d.kind === 'trend' || d.kind === 'arrow' || d.kind === 'fib') && d.points.length === 2) {
-    const a = timePriceToPx(d.points[0].time, d.points[0].price);
-    const b = timePriceToPx(d.points[1].time, d.points[1].price);
+    pts = [{ x: paneSize().pw / 2, y: a.y, i: 0 }];
+  } else if (d.kind === 'hray' || d.kind === 'text') {
+    const a = P(0);
+    if (!a) return '';
+    pts = [{ x: a.x, y: a.y, i: 0 }];
+  } else if (d.kind === 'position') {
+    const a = P(0), b = P(1);
     if (!a || !b) return '';
-    pts = [{ px: a, idx: 0 }, { px: b, idx: 1 }];
+    const tY = _activeSeries.priceToCoordinate(d.points[2] ? d.points[2].price : d.points[0].price);
+    const x = Math.min(a.x, b.x), wd = Math.max(24, Math.abs(b.x - a.x));
+    pts = [{ x: a.x, y: a.y, i: 0 }, { x: b.x, y: b.y, i: 1 }];
+    if (tY != null) pts.push({ x: x + wd / 2, y: tY, i: 2 });
   } else {
-    return '';
+    const a = P(0), b = P(1);
+    if (!a || !b) return '';
+    pts = [{ x: a.x, y: a.y, i: 0 }, { x: b.x, y: b.y, i: 1 }];
   }
-
-  return pts.map(({ px, idx }) =>
-    `<circle class="draw-handle" data-draw-id="${d.id}" data-handle-idx="${idx}"
-             cx="${px.x}" cy="${px.y}" r="5"/>`
-  ).join('');
+  return pts.map(p => `<circle class="draw-handle" data-draw-id="${d.id}" data-handle-idx="${p.i}" cx="${p.x}" cy="${p.y}" r="5"/>`).join('');
 }
 
-function escapeText(s) {
-  return String(s).replace(/[<>&"']/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'})[c]);
-}
-
-// Re-render overlay when chart moves (zoom/pan)
+// Re-render overlay when the chart moves (zoom / pan / resize)
 function attachChartSyncForDrawings() {
   if (!_activeChart) return;
-  _activeChart.timeScale().subscribeVisibleTimeRangeChange(renderOverlay);
   _activeChart.timeScale().subscribeVisibleLogicalRangeChange(renderOverlay);
-  // Also re-render on resize
   if (window.ResizeObserver) {
     const host = document.getElementById('detailChart');
-    if (host) new ResizeObserver(renderOverlay).observe(host);
+    if (host) new ResizeObserver(() => renderOverlay()).observe(host);
   }
 }
