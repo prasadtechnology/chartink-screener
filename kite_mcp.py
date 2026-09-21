@@ -284,6 +284,69 @@ def last_price(session_id, exchange, symbol):
         return None
 
 
+def ltp(session_id, tickers):
+    """Map {yf_ticker: last_price} for yfinance-style tickers in one get_ltp call.
+
+    Read-only. Mirrors kite_data.ltp so callers stay source-agnostic. Returns {}
+    when not authenticated or on any failure, so the caller can fall back
+    silently. Index/`.NS`/`.BO`/plain symbols are all normalised via
+    _to_kite_symbol (defined below; resolved at call time).
+    """
+    if not session_id or not tickers:
+        return {}
+    mapping = {t: _to_kite_symbol(t) for t in tickers}
+    data = _call_tool_json(session_id, 'get_ltp',
+                           {'instruments': list(set(mapping.values()))})
+    if not isinstance(data, dict):
+        return {}
+    out = {}
+    for t, k in mapping.items():
+        entry = data.get(k)
+        lp = entry.get('last_price') if isinstance(entry, dict) else None
+        try:
+            if lp:
+                out[t] = float(lp)
+        except Exception:
+            pass
+    return out
+
+
+def ohlc(session_id, tickers):
+    """Map {yf_ticker: {last_price, open, high, low, prev_close}} via one get_ohlc call.
+
+    Read-only. Kite's get_ohlc returns each instrument's last_price plus the day's
+    OHLC where ohlc.close is the *previous* day's close. Used to show the day low/
+    high and an accurate live candle on the detail chart. Returns {} on any failure.
+    """
+    if not session_id or not tickers:
+        return {}
+    mapping = {t: _to_kite_symbol(t) for t in tickers}
+    data = _call_tool_json(session_id, 'get_ohlc', {'instruments': list(set(mapping.values()))})
+    if not isinstance(data, dict):
+        return {}
+
+    def _f(v):
+        try:
+            return float(v) if v is not None else None
+        except Exception:
+            return None
+
+    out = {}
+    for t, k in mapping.items():
+        entry = data.get(k)
+        if not isinstance(entry, dict):
+            continue
+        o = entry.get('ohlc') or {}
+        out[t] = {
+            'last_price': _f(entry.get('last_price')),
+            'open': _f(o.get('open')),
+            'high': _f(o.get('high')),
+            'low': _f(o.get('low')),
+            'prev_close': _f(o.get('close')),
+        }
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Historical chart data via the browser-login MCP (no API key)
 # ---------------------------------------------------------------------------

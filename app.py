@@ -569,6 +569,59 @@ def kite_mcp_logout():
     return jsonify({'ok': True})
 
 
+@app.route('/api/kite_mcp/ltp', methods=['POST'])
+@login_required
+def kite_mcp_ltp():
+    """Live last-traded prices for a set of symbols via the browser-login Kite MCP.
+
+    Read-only. Lets a section show live CMP straight from Kite without depending
+    on the yfinance chart source (used by the RED custom section). Returns
+    connected=False with empty prices when Kite MCP isn't authorised, so the
+    caller falls back silently. Plain symbols are assumed NSE (matching how
+    custom-section stubs are keyed); pass a `.NS`/`.BO` suffix for BSE.
+    """
+    data = request.get_json(silent=True) or {}
+    symbols = data.get('symbols') or []
+    exchange = (data.get('exchange') or 'NSE').upper()
+    if not symbols:
+        return jsonify({'connected': False, 'prices': {}})
+    sid = session.get('kite_mcp_sid') or kite_mcp.active_session()
+    if not sid:
+        return jsonify({'connected': False, 'prices': {}})
+    tickers = [s if ('.' in s or ':' in s) else to_yfinance_ticker(s, exchange)
+               for s in symbols]
+    prices_by_ticker = kite_mcp.ltp(sid, tickers)
+    out = {}
+    for s, t in zip(symbols, tickers):
+        if prices_by_ticker.get(t) is not None:
+            out[s] = prices_by_ticker[t]
+    return jsonify({'connected': True, 'prices': out})
+
+
+@app.route('/api/kite_mcp/ohlc', methods=['POST'])
+@login_required
+def kite_mcp_ohlc():
+    """Live last price + day OHLC (open/high/low + previous close) per symbol via the
+    browser-login Kite MCP. Read-only. Powers the detail chart's live header (day low/
+    high) and live candle. connected=False with empty data when Kite isn't authorised."""
+    data = request.get_json(silent=True) or {}
+    symbols = data.get('symbols') or []
+    exchange = (data.get('exchange') or 'NSE').upper()
+    if not symbols:
+        return jsonify({'connected': False, 'data': {}})
+    sid = session.get('kite_mcp_sid') or kite_mcp.active_session()
+    if not sid:
+        return jsonify({'connected': False, 'data': {}})
+    tickers = [s if ('.' in s or ':' in s) else to_yfinance_ticker(s, exchange)
+               for s in symbols]
+    by_ticker = kite_mcp.ohlc(sid, tickers)
+    out = {}
+    for s, t in zip(symbols, tickers):
+        if t in by_ticker:
+            out[s] = by_ticker[t]
+    return jsonify({'connected': True, 'data': out})
+
+
 # --- Chart data source: yfinance <-> Kite (toggle in the dashboard) -----------
 @app.route('/api/data_source', methods=['GET'])
 @login_required

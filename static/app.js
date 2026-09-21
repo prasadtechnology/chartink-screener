@@ -1307,7 +1307,7 @@ function sortAndRerender() {
     tabBody.querySelector('#browseSectorTopBtn')?.addEventListener('click', browseSectorTopStocks);
   } else if (active.isCustom) {
     const grid = tabBody.querySelector(`[data-grid="custom-${active.sectionId}"]`);
-    if (grid) renderCustomCards(active.items, grid);
+    if (grid) renderCustomCards(active.items, grid, active);
   } else {
     const breakoutsGrid = tabBody.querySelector(`[data-grid="breakouts-${active.id}"]`);
     if (breakoutsGrid) breakouts.forEach(r => breakoutsGrid.appendChild(buildCardEl(r)));
@@ -1769,7 +1769,7 @@ function cssId(s) { return (s || '').replace(/[^a-zA-Z0-9]/g, '_'); }
 // Render a custom section's cards. Symbols already in the scan render at once;
 // symbols that aren't (after a reload, or rejected stocks) render as a stub and
 // get filled in from the cached screener so the section always shows everything.
-async function renderCustomCards(items, grid) {
+async function renderCustomCards(items, grid, section) {
   grid.innerHTML = '';
   items.forEach(r => grid.appendChild(buildCardEl(r)));
   for (const r of items.filter(x => x._stub)) {
@@ -1786,6 +1786,105 @@ async function renderCustomCards(items, grid) {
       if (ph) ph.replaceWith(buildCardEl(full));
     } catch (e) { /* keep the stub card */ }
   }
+  // The RED section shows live CMP straight from Kite MCP (yfinance CMP can be
+  // stale/unavailable). Scoped to this one section by name; every other section
+  // keeps its screener CMP. Runs after stubs resolve so the final cards exist.
+  if (section && String(section.label || '').trim().toUpperCase() === 'RED') {
+    startRedLivePolling(items, grid);
+  } else {
+    stopRedLivePolling();
+  }
+}
+
+// --- RED section live polling ------------------------------------------------
+// Kite quote APIs are capped at 1 req/sec. We batch the entire section into ONE
+// get_ltp call and poll every RED_LIVE_POLL_MS (well under the cap), only while
+// the RED grid is on-screen and the page is visible. A single timer is reused,
+// so tabs can never stack overlapping pollers.
+const RED_LIVE_POLL_MS = 3000;
+let _redLiveTimer = null;
+
+function stopRedLivePolling() {
+  if (_redLiveTimer) { clearInterval(_redLiveTimer); _redLiveTimer = null; }
+}
+
+function startRedLivePolling(items, grid) {
+  stopRedLivePolling();
+  applyLiveKitePrices(items, grid);            // immediate first paint
+  _redLiveTimer = setInterval(() => {
+    // Self-terminate once the grid leaves the DOM (user switched tab / re-render).
+    if (!document.body.contains(grid)) { stopRedLivePolling(); return; }
+    // Don't spend quota while the page is hidden (background tab / minimised).
+    if (document.hidden) return;
+    applyLiveKitePrices(items, grid);
+  }, RED_LIVE_POLL_MS);
+}
+
+// Overlay live last-traded prices from Kite MCP onto a grid's cards. Best-effort:
+// silently no-ops when Kite MCP isn't connected. Also recomputes % from pivot
+// against the live price so the section reads as genuinely live.
+async function applyLiveKitePrices(items, grid) {
+  const symOf = r => r.input_symbol || (r.ticker || '').replace(/\.(NS|BO)$/, '');
+  const symbols = [...new Set(items.map(symOf).filter(Boolean))];
+  if (!symbols.length) return;
+
+  // Visible heartbeat on the section header, so the poll is observable even when
+  // prices don't move (market closed) or Kite MCP isn't connected.
+  const head = grid.closest('.results-section')?.querySelector('.section-head');
+  let statusEl = head ? head.querySelector('.red-live-status') : null;
+  if (head && !statusEl) {
+    statusEl = document.createElement('span');
+    statusEl.className = 'red-live-status';
+    const count = head.querySelector('.results-count');
+    if (count) count.insertAdjacentElement('afterend', statusEl); else head.appendChild(statusEl);
+  }
+  const setStatus = (html, cls) => { if (statusEl) { statusEl.innerHTML = html; statusEl.className = 'red-live-status ' + (cls || ''); } };
+  const now = () => new Date().toLocaleTimeString('en-IN', { hour12: false });
+
+  let data;
+  try {
+    const res = await fetch('/api/kite_mcp/ltp', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ symbols }),
+    });
+    data = await res.json();
+  } catch (e) { setStatus('○ offline', 'muted'); return; }
+
+  if (!data || !data.connected) { setStatus('○ connect Kite for live prices', 'muted'); return; }
+  const prices = data.prices || {};
+
+  const pivotBy = {};
+  items.forEach(r => { const sm = symOf(r); if (sm && r.pivot != null) pivotBy[sm] = r.pivot; });
+  (state.results || []).forEach(r => { const sm = r.input_symbol; if (sm && r.pivot != null && pivotBy[sm] == null) pivotBy[sm] = r.pivot; });
+  const cards = {};
+  grid.querySelectorAll('.card').forEach(c => { if (c.dataset.symbol) cards[c.dataset.symbol] = c; });
+
+  let n = 0;
+  for (const [sym, price] of Object.entries(prices)) {
+    if (price == null) continue;
+    const card = cards[sym];
+    if (!card) continue;
+    const row = card.querySelector('.card-row');
+    if (!row) continue;
+    const cmpB = row.querySelector('span b');
+    if (cmpB) {
+      const nextTxt = '₹' + Number(price).toLocaleString('en-IN');
+      if (cmpB.textContent !== nextTxt) { cmpB.classList.remove('cmp-flash'); void cmpB.offsetWidth; cmpB.classList.add('cmp-flash'); }
+      cmpB.textContent = nextTxt;
+    }
+    const firstSpan = row.querySelector('span');
+    if (firstSpan && !firstSpan.querySelector('.live-dot')) {
+      firstSpan.insertAdjacentHTML('beforeend', ' <span class="live-dot" title="Live via Kite">●</span>');
+    }
+    const pivot = pivotBy[sym];
+    if (pivot) {
+      const pct = Math.round(((pivot - price) / pivot * 100) * 10) / 10;
+      const spans = row.querySelectorAll('span');
+      if (spans.length >= 2) spans[spans.length - 1].innerHTML = fromPivotText({ pct_from_pivot: pct });
+    }
+    n++;
+  }
+  setStatus(`● Live · ${n} price${n === 1 ? '' : 's'} · ${now()}`, 'ok');
 }
 
 function fromPivotText(r) {
@@ -1812,6 +1911,8 @@ document.addEventListener('keydown', (e) => {
 function closeModal() {
   $('modal').classList.add('hidden');
   $('modal').classList.remove('browse-mode');
+  $('modal').classList.remove('chart-fullscreen');
+  stopChartLivePolling();
   _drawState.symbol = null;
   _drawState.drawings = [];
   _drawState.drafting = null;
@@ -1823,6 +1924,109 @@ function closeModal() {
   document.getElementById('browseBar')?.remove();
   document.getElementById('browseInfoPanel')?.remove();
   document.getElementById('browseSidePanel')?.remove();
+}
+
+// --- Chart live price via Kite MCP ------------------------------------------
+// While the detail chart is open, poll the live LTP for its symbol and reflect it
+// on the header price / day-change and the last candle. One symbol per poll (quote
+// limit is 1 req/sec; we poll every CHART_LIVE_POLL_MS). Stops on modal close.
+const CHART_LIVE_POLL_MS = 3000;
+let _chartLiveTimer = null;
+let _chartLiveSymbol = null;
+
+function stopChartLivePolling() {
+  if (_chartLiveTimer) { clearInterval(_chartLiveTimer); _chartLiveTimer = null; }
+  _chartLiveSymbol = null;
+}
+
+function startChartLivePolling(r) {
+  stopChartLivePolling();
+  const sym = r.input_symbol || (r.ticker || '').replace(/\.(NS|BO)$/, '');
+  if (!sym) return;
+  _chartLiveSymbol = sym;
+  applyChartLivePrice(sym);
+  _chartLiveTimer = setInterval(() => {
+    if ($('modal').classList.contains('hidden') || _chartLiveSymbol !== sym) { stopChartLivePolling(); return; }
+    if (document.hidden) return;
+    applyChartLivePrice(sym);
+  }, CHART_LIVE_POLL_MS);
+}
+
+async function applyChartLivePrice(sym) {
+  let data;
+  try {
+    const res = await fetch('/api/kite_mcp/ohlc', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ symbols: [sym] }),
+    });
+    data = await res.json();
+  } catch (e) { return; }
+  if (!data || !data.connected) { setChartLiveBadge(false); return; }
+  const q = data.data ? data.data[sym] : null;
+  const price = q ? q.last_price : null;
+  if (price == null) { setChartLiveBadge(false); return; }
+
+  const head = document.querySelector('.modal-head');
+  const px = head ? head.querySelector('.mh-px') : null;
+  const chg = head ? head.querySelector('.mh-chg') : null;
+  const rs = v => '₹' + Number(v).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+  // Day change vs previous close (from Kite when available, else the prior bar).
+  const prevClose = (q.prev_close != null) ? q.prev_close
+    : ((_activeData && _activeData.length >= 2) ? _activeData[_activeData.length - 2].close : price);
+  const delta = price - prevClose;
+  const pct = prevClose ? (delta / prevClose) * 100 : 0;
+  const sign = delta >= 0 ? '+' : '';
+  if (px) px.textContent = rs(price);
+  if (chg) { chg.textContent = `${sign}${delta.toFixed(2)} (${sign}${pct.toFixed(2)}%)`; chg.className = 'mh-chg ' + (delta >= 0 ? 'pos' : 'neg'); }
+
+  // Day low chip (and high, kept ready alongside).
+  if (head) {
+    setHeaderStat('mh-low', 'L', q.low, head);
+    setHeaderStat('mh-high', 'H', q.high, head);
+  }
+
+  // Live candle from the real day OHLC (falls back to extending the last bar).
+  if (_activeSeries && _activeData && _activeData.length) {
+    const last = _activeData[_activeData.length - 1];
+    last.open = (q.open != null) ? q.open : last.open;
+    last.high = (q.high != null) ? q.high : Math.max(last.high, price);
+    last.low = (q.low != null) ? q.low : Math.min(last.low, price);
+    last.close = price;
+    try { _activeSeries.update({ time: last.time, open: last.open, high: last.high, low: last.low, close: price }); } catch (e) {}
+  }
+  setChartLiveBadge(true);
+}
+
+// Insert/update a small "L ₹x" / "H ₹x" chip in the chart header, ordered
+// after the day-change. cls: 'mh-low' | 'mh-high'.
+function setHeaderStat(cls, label, val, head) {
+  let el = head.querySelector('.' + cls);
+  if (val == null) { if (el) el.remove(); return; }
+  if (!el) {
+    el = document.createElement('span');
+    el.className = 'mh-stat ' + cls;
+    const anchor = cls === 'mh-high'
+      ? (head.querySelector('.mh-low') || head.querySelector('.mh-chg'))
+      : head.querySelector('.mh-chg');
+    if (anchor) anchor.insertAdjacentElement('afterend', el); else head.appendChild(el);
+  }
+  el.innerHTML = `<span class="mh-stat-l">${label}</span> ₹${Number(val).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+function setChartLiveBadge(on) {
+  const head = document.querySelector('.modal-head');
+  if (!head) return;
+  let badge = head.querySelector('.mh-live');
+  if (on && !badge) {
+    badge = document.createElement('span');
+    badge.className = 'mh-live';
+    badge.textContent = '● LIVE';
+    const anchor = head.querySelector('.mh-high') || head.querySelector('.mh-low') || head.querySelector('.mh-chg');
+    if (anchor) anchor.insertAdjacentElement('afterend', badge); else head.appendChild(badge);
+  } else if (!on && badge) {
+    badge.remove();
+  }
 }
 
 function fmtRs(v) {
@@ -1905,6 +2109,10 @@ function openModal(r) {
           <button class="tb-btn tb-range-btn active" data-range="120">4M</button>
           <button class="tb-btn tb-range-btn" data-range="180">6M</button>
           <button class="tb-btn tb-range-btn" data-range="all">All</button>
+        </div>
+        <div class="tb-sep"></div>
+        <div class="tb-group" title="Fullscreen chart">
+          <button class="tb-btn" id="chartFullscreenBtn" title="Toggle fullscreen chart" aria-label="Toggle fullscreen chart"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3M16 21h3a2 2 0 0 0 2-2v-3"/></svg></button>
         </div>
       </div>
     </div>
@@ -2022,12 +2230,24 @@ function openModal(r) {
     });
   }
 
+  // Fullscreen toggle for the chart modal
+  const fsBtn = document.getElementById('chartFullscreenBtn');
+  if (fsBtn) {
+    fsBtn.addEventListener('click', () => {
+      const on = $('modal').classList.toggle('chart-fullscreen');
+      fsBtn.classList.toggle('active', on);
+      // Let the chart adopt the new container size, then repaint the drawings overlay.
+      requestAnimationFrame(() => { try { window.dispatchEvent(new Event('resize')); renderOverlay(); } catch (e) {} });
+    });
+  }
+
   requestAnimationFrame(() => {
     renderDetailChart(r);
     wireDrawTools();
     attachChartSyncForDrawings();
     loadDrawingsFor(r.input_symbol || r.ticker);
     renderIndicators(r);
+    startChartLivePolling(r);
   });
 }
 
@@ -3804,12 +4024,42 @@ function pxToTimePrice(x, y) {
   if (!bar) return null;
   const price = _activeSeries.coordinateToPrice(y);
   if (price == null) return null;
-  return { time: bar.time, price };
+  // Store a normalized epoch-seconds anchor (not the raw bar.time, which is a date
+  // string on the initial render and an epoch on the timeframe-switch path). This
+  // keeps drawings source- and format-independent going forward.
+  const epoch = timeToEpoch(bar.time);
+  return { time: isNaN(epoch) ? bar.time : epoch, price };
+}
+
+// Convert any lightweight-charts time (date string 'YYYY-MM-DD', epoch seconds,
+// or {year,month,day}) to comparable epoch seconds, for nearest-bar matching.
+function timeToEpoch(t) {
+  if (t == null) return NaN;
+  if (typeof t === 'number') return t;
+  if (typeof t === 'string') { const ms = Date.parse(t.length <= 10 ? t + 'T00:00:00Z' : t); return isNaN(ms) ? NaN : ms / 1000; }
+  if (typeof t === 'object' && t.year) return Date.UTC(t.year, (t.month || 1) - 1, t.day || 1) / 1000;
+  return NaN;
 }
 
 function timePriceToPx(time, price) {
   if (!_activeChart || !_activeSeries) return null;
-  const x = _activeChart.timeScale().timeToCoordinate(time);
+  const ts = _activeChart.timeScale();
+  let x = ts.timeToCoordinate(time);
+  // A drawing anchored to a date that isn't an exact bar on the *current* series
+  // (different data source / trading calendar / time format — e.g. yfinance vs Kite)
+  // makes timeToCoordinate return null and the shape silently vanishes. Snap to the
+  // nearest loaded bar by time so the drawing still renders.
+  if (x == null && _activeData && _activeData.length) {
+    const target = timeToEpoch(time);
+    if (!isNaN(target)) {
+      let bestI = -1, bestD = Infinity;
+      for (let i = 0; i < _activeData.length; i++) {
+        const d = Math.abs(timeToEpoch(_activeData[i].time) - target);
+        if (d < bestD) { bestD = d; bestI = i; }
+      }
+      if (bestI >= 0) { const cx = ts.logicalToCoordinate(bestI); if (cx != null) x = cx; }
+    }
+  }
   const y = _activeSeries.priceToCoordinate(price);
   if (x == null || y == null) return null;
   return { x, y };
