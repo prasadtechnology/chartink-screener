@@ -63,6 +63,8 @@ def init_db():
                 qty INTEGER NOT NULL,
                 opened_at INTEGER NOT NULL,
                 notes TEXT,
+                source TEXT NOT NULL DEFAULT 'manual',
+                long_term INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_holdings_user ON holdings(user_id);
@@ -97,6 +99,7 @@ def init_db():
                 opened_at INTEGER,
                 closed_at INTEGER NOT NULL,
                 notes TEXT,
+                external_id TEXT,
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_closed_user ON closed_positions(user_id);
@@ -136,6 +139,22 @@ def init_db():
                 PRIMARY KEY (symbol, exchange, interval)
             );
             CREATE INDEX IF NOT EXISTS idx_cache_date ON chart_cache(cached_date);
+
+            CREATE TABLE IF NOT EXISTS scan_breadth (
+                user_id INTEGER NOT NULL,
+                scan_date TEXT NOT NULL,
+                unique_count INTEGER NOT NULL,
+                files INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (user_id, scan_date),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_breadth_user ON scan_breadth(user_id);
+
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
         ''')
 
         # Migration for older databases
@@ -143,6 +162,27 @@ def init_db():
             if _table_exists(conn, tbl) and not _column_exists(conn, tbl, 'user_id'):
                 conn.execute(f'ALTER TABLE {tbl} ADD COLUMN user_id INTEGER')
                 conn.execute(f'UPDATE {tbl} SET user_id = 1 WHERE user_id IS NULL')
+        # Provenance of a holding: 'manual' or 'kite' (added for Kite portfolio sync).
+        if _table_exists(conn, 'holdings') and not _column_exists(conn, 'holdings', 'source'):
+            conn.execute("ALTER TABLE holdings ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")
+        # Long-term hold flag: no stop expected, excluded from open-risk & R math.
+        if _table_exists(conn, 'holdings') and not _column_exists(conn, 'holdings', 'long_term'):
+            conn.execute("ALTER TABLE holdings ADD COLUMN long_term INTEGER NOT NULL DEFAULT 0")
+        # Drawing line width (0 = the tool's default) and style ('' / solid / dashed / dotted).
+        if _table_exists(conn, 'drawings'):
+            if not _column_exists(conn, 'drawings', 'line_width'):
+                conn.execute("ALTER TABLE drawings ADD COLUMN line_width REAL NOT NULL DEFAULT 0")
+            if not _column_exists(conn, 'drawings', 'line_style'):
+                conn.execute("ALTER TABLE drawings ADD COLUMN line_style TEXT NOT NULL DEFAULT ''")
+        # Dedup key for trades imported from Kite ("Pull journal from Kite").
+        # Add the column first (older DBs lack it), then build the unique index —
+        # doing it here (not in the CREATE block above) guarantees the column
+        # exists for both fresh and upgraded databases before the index is built.
+        if _table_exists(conn, 'closed_positions'):
+            if not _column_exists(conn, 'closed_positions', 'external_id'):
+                conn.execute("ALTER TABLE closed_positions ADD COLUMN external_id TEXT")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_closed_ext "
+                         "ON closed_positions(user_id, external_id) WHERE external_id IS NOT NULL")
 
 
 # ---------------- Chart cache (shared across users) ----------------
@@ -155,13 +195,15 @@ except Exception:
 
 
 def trading_date_today():
-    """Return today's IST date as YYYY-MM-DD string.
+    """Return today's calendar date in IST as a YYYY-MM-DD string.
 
-    Note: this is calendar 'today' in IST, not the last trading day. If today
-    is a Sunday, we return Sunday. The cache will miss for symbols not yet
-    fetched today, hit yfinance, and yfinance will return Friday's data —
-    which is what we want. The cached_date we store is the date of the LATEST
-    bar in the data, not today's calendar date.
+    This stamp is the cache's freshness key: an entry counts as fresh only if
+    it was stored on the same IST calendar date. Note this is calendar 'today',
+    not the last *trading* day — on a weekend or holiday, an entry stored on a
+    previous calendar day is treated as stale and re-fetched once. yfinance
+    simply returns the last trading day's bars again, so the data stays
+    correct; the cost is one redundant fetch per symbol per calendar day, an
+    acceptable trade-off for not maintaining an NSE holiday calendar.
     """
     if _IST:
         return _dt.datetime.now(_IST).strftime('%Y-%m-%d')
@@ -198,6 +240,14 @@ def set_chart_cache(symbol, exchange, interval, payload):
             (symbol.upper(), exchange.upper(), interval, today,
              json.dumps(payload), int(time.time()))
         )
+
+
+def clear_chart_cache():
+    """Delete ALL cached chart/screen data (e.g. after switching data source),
+    so the next fetch pulls fresh bars from the newly-selected provider."""
+    with get_conn() as conn:
+        cur = conn.execute('DELETE FROM chart_cache')
+        return cur.rowcount
 
 
 def clean_stale_chart_cache(keep_days=2):
@@ -358,11 +408,6 @@ def get_user_by_id(user_id):
         return dict(row) if row else None
 
 
-def user_count():
-    with get_conn() as conn:
-        return conn.execute('SELECT COUNT(*) AS n FROM users').fetchone()['n']
-
-
 # ---------------- Holdings ----------------
 def list_holdings(user_id):
     with get_conn() as conn:
@@ -373,21 +418,73 @@ def list_holdings(user_id):
         return [dict(r) for r in rows]
 
 
-def add_holding(user_id, symbol, exchange, entry, stop, qty, notes=None):
+def add_holding(user_id, symbol, exchange, entry, stop, qty, notes=None, source='manual'):
     with get_conn() as conn:
         cur = conn.execute(
-            'INSERT INTO holdings (user_id, symbol, exchange, entry, stop, qty, opened_at, notes) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            'INSERT INTO holdings (user_id, symbol, exchange, entry, stop, qty, opened_at, notes, source) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (user_id, symbol.upper(), (exchange or 'NSE').upper(),
-             float(entry), float(stop), int(qty), int(time.time()), notes)
+             float(entry), float(stop), int(qty), int(time.time()), notes, source)
         )
         return cur.lastrowid
+
+
+def upsert_kite_holding(user_id, symbol, exchange, avg_price, qty, stop=None):
+    """Insert or update a Kite-sourced holding, matched on (user, symbol, exchange).
+
+    Returns {'id', 'action': 'added'|'updated'}. Stop handling:
+      - a real stop (0 < stop < entry, e.g. from a GTT) is always adopted;
+      - otherwise the stop is left "unset" (stored == entry, a sentinel that makes
+        open-risk and R read as 0) so the user can fill it in;
+      - a stop the user has already set manually is preserved across syncs.
+    """
+    symbol = symbol.upper()
+    exchange = (exchange or 'NSE').upper()
+    avg_price = float(avg_price)
+    qty = int(qty)
+    has_gtt = stop is not None and 0 < float(stop) < avg_price
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM holdings WHERE user_id = ? AND symbol = ? AND exchange = ? AND source = 'kite'",
+            (user_id, symbol, exchange)
+        ).fetchone()
+        if row:
+            row = dict(row)
+            unset = row['stop'] >= row['entry'] or row['stop'] <= 0
+            if has_gtt:
+                new_stop = float(stop)
+            elif unset:
+                new_stop = avg_price          # keep the "unset" sentinel aligned to the new entry
+            else:
+                new_stop = row['stop']         # preserve a user-set stop
+            conn.execute(
+                'UPDATE holdings SET entry = ?, qty = ?, stop = ? WHERE id = ?',
+                (avg_price, qty, float(new_stop), row['id'])
+            )
+            return {'id': row['id'], 'action': 'updated'}
+        stop_val = float(stop) if has_gtt else avg_price
+        cur = conn.execute(
+            "INSERT INTO holdings (user_id, symbol, exchange, entry, stop, qty, opened_at, notes, source) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'kite')",
+            (user_id, symbol, exchange, avg_price, stop_val, qty, int(time.time()), None)
+        )
+        return {'id': cur.lastrowid, 'action': 'added'}
 
 
 def delete_holding(user_id, id_):
     with get_conn() as conn:
         cur = conn.execute(
             'DELETE FROM holdings WHERE id = ? AND user_id = ?', (id_, user_id)
+        )
+        return cur.rowcount > 0
+
+
+def set_holding_long_term(user_id, id_, flag):
+    """Mark/unmark a holding as a long-term hold (no stop, excluded from risk)."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            'UPDATE holdings SET long_term = ? WHERE id = ? AND user_id = ?',
+            (1 if flag else 0, id_, user_id)
         )
         return cur.rowcount > 0
 
@@ -433,22 +530,39 @@ def list_drawings(user_id, symbol=None):
         return out
 
 
-def add_drawing(user_id, symbol, exchange, type_, name, color, points):
+_LINE_STYLES = {'', 'solid', 'dashed', 'dotted'}
+
+
+def _clean_line_width(v):
+    try:
+        v = float(v or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0.0, min(8.0, v))
+
+
+def add_drawing(user_id, symbol, exchange, type_, name, color, points, line_width=0, line_style=''):
+    line_style = line_style if line_style in _LINE_STYLES else ''
     with get_conn() as conn:
         cur = conn.execute(
-            'INSERT INTO drawings (user_id, symbol, exchange, type, name, color, points_json, created_at) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            'INSERT INTO drawings (user_id, symbol, exchange, type, name, color, points_json, created_at, '
+            'line_width, line_style) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (user_id, symbol.upper(), (exchange or 'NSE').upper(), type_, name or '',
-             color or '#2563eb', json.dumps(points), int(time.time()))
+             color or '#2563eb', json.dumps(points), int(time.time()),
+             _clean_line_width(line_width), line_style)
         )
         return cur.lastrowid
 
 
 def update_drawing(user_id, id_, fields):
     """Update name/color/points on an existing drawing owned by user."""
-    allowed = {'name', 'color', 'points_json'}
+    allowed = {'name', 'color', 'points_json', 'line_width', 'line_style'}
     if 'points' in fields:
         fields['points_json'] = json.dumps(fields.pop('points'))
+    if 'line_width' in fields:
+        fields['line_width'] = _clean_line_width(fields['line_width'])
+    if 'line_style' in fields and fields['line_style'] not in _LINE_STYLES:
+        fields.pop('line_style')
     fields = {k: v for k, v in fields.items() if k in allowed}
     if not fields:
         return False
@@ -479,6 +593,84 @@ def clear_drawings(user_id, symbol):
 
 
 # ---------------- Closed positions ----------------
+def add_closed_trade(user_id, t):
+    """Insert a fully-specified closed round-trip trade, deduped by external_id.
+
+    Used by the "Pull journal from Kite" import. Returns 'added', or 'skipped'
+    when a trade with the same external_id already exists for this user.
+    """
+    ext = t.get('external_id')
+    with get_conn() as conn:
+        if ext:
+            exists = conn.execute(
+                'SELECT 1 FROM closed_positions WHERE user_id = ? AND external_id = ?',
+                (user_id, ext)
+            ).fetchone()
+            if exists:
+                return 'skipped'
+        conn.execute(
+            'INSERT INTO closed_positions '
+            '(user_id, symbol, exchange, entry, exit, stop, qty, pnl, r_multiple, '
+            'opened_at, closed_at, notes, external_id) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (user_id, t['symbol'], (t.get('exchange') or 'NSE').upper(),
+             float(t['entry']), float(t['exit']), float(t['stop']), int(t['qty']),
+             float(t['pnl']), float(t['r_multiple']), t.get('opened_at'),
+             int(t['closed_at']), t.get('notes'), ext)
+        )
+        return 'added'
+
+
+def import_console_trades(user_id, trades, start_ts, end_ts):
+    """Upsert authoritative realised trades from a Kite Console P&L export.
+
+    Console figures are the source of truth, so for each imported symbol we first
+    remove app-generated rows (LTP-guessed sync closes with a NULL external_id,
+    and same-window live-pull rows 'kite:%') that fall inside the report window —
+    they're superseded to avoid double counting. The window-bounded delete
+    protects trades outside the report's date range. `opened_at` is carried over
+    from a superseded row when the export doesn't carry it. Re-importing the same
+    window updates in place (dedup by external_id). Returns counts.
+    """
+    added = updated = replaced = 0
+    with get_conn() as conn:
+        for t in trades:
+            sym, ext = t['symbol'], t['external_id']
+            prev = conn.execute(
+                "SELECT id, opened_at FROM closed_positions "
+                "WHERE user_id = ? AND symbol = ? "
+                "AND (external_id IS NULL OR external_id LIKE 'kite:%') "
+                "AND (closed_at IS NULL OR (closed_at >= ? AND closed_at <= ?)) "
+                "ORDER BY opened_at IS NULL, opened_at LIMIT 1",
+                (user_id, sym, start_ts, end_ts)).fetchone()
+            carried_opened = t.get('opened_at') or (prev['opened_at'] if prev else None)
+            cur = conn.execute(
+                "DELETE FROM closed_positions WHERE user_id = ? AND symbol = ? "
+                "AND (external_id IS NULL OR external_id LIKE 'kite:%') "
+                "AND (closed_at IS NULL OR (closed_at >= ? AND closed_at <= ?))",
+                (user_id, sym, start_ts, end_ts))
+            replaced += cur.rowcount
+            existing = conn.execute(
+                "SELECT id FROM closed_positions WHERE user_id = ? AND external_id = ?",
+                (user_id, ext)).fetchone()
+            vals = (t['entry'], t['exit'], t['stop'], t['qty'], t['pnl'],
+                    t['r_multiple'], carried_opened, t['closed_at'], t.get('notes'))
+            if existing:
+                conn.execute(
+                    "UPDATE closed_positions SET entry=?, exit=?, stop=?, qty=?, "
+                    "pnl=?, r_multiple=?, opened_at=?, closed_at=?, notes=? WHERE id=?",
+                    (*vals, existing['id']))
+                updated += 1
+            else:
+                conn.execute(
+                    "INSERT INTO closed_positions (user_id, symbol, exchange, entry, "
+                    "exit, stop, qty, pnl, r_multiple, opened_at, closed_at, notes, external_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (user_id, sym, t.get('exchange', 'NSE'), *vals, ext))
+                added += 1
+    return {'added': added, 'updated': updated, 'replaced': replaced}
+
+
 def list_closed_positions(user_id, limit=200):
     with get_conn() as conn:
         rows = conn.execute(
@@ -486,6 +678,70 @@ def list_closed_positions(user_id, limit=200):
             (user_id, limit)
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def delete_closed_position(user_id, id_):
+    with get_conn() as conn:
+        cur = conn.execute(
+            'DELETE FROM closed_positions WHERE id = ? AND user_id = ?', (id_, user_id)
+        )
+        return cur.rowcount > 0
+
+
+def clear_closed_positions(user_id):
+    with get_conn() as conn:
+        cur = conn.execute(
+            'DELETE FROM closed_positions WHERE user_id = ?', (user_id,)
+        )
+        return cur.rowcount
+
+
+# ---------------- Scan breadth (market-breadth trend) ----------------
+def record_scan_breadth(user_id, unique_count, files=0):
+    """Upsert today's scan size (unique symbols) for the user — one point per day.
+
+    Re-scanning the same day overwrites, so the trend is a clean daily series of
+    "how many stocks the screen surfaced". Uses IST calendar date to match the
+    chart cache's day boundary.
+    """
+    date = trading_date_today()
+    with get_conn() as conn:
+        conn.execute(
+            'INSERT INTO scan_breadth (user_id, scan_date, unique_count, files, updated_at) '
+            'VALUES (?, ?, ?, ?, ?) '
+            'ON CONFLICT(user_id, scan_date) DO UPDATE SET '
+            'unique_count = excluded.unique_count, files = excluded.files, '
+            'updated_at = excluded.updated_at',
+            (user_id, date, int(unique_count), int(files), int(time.time()))
+        )
+    return {'date': date, 'unique_count': int(unique_count)}
+
+
+def list_scan_breadth(user_id, limit=365):
+    """Chronological breadth history (oldest -> newest) for the user."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            'SELECT scan_date, unique_count, files, updated_at FROM scan_breadth '
+            'WHERE user_id = ? ORDER BY scan_date ASC LIMIT ?',
+            (user_id, limit)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+# ---------------- App settings (global key/value) ----------------
+def get_setting(key, default=None):
+    with get_conn() as conn:
+        row = conn.execute('SELECT value FROM app_settings WHERE key = ?', (key,)).fetchone()
+        return row['value'] if row else default
+
+
+def set_setting(key, value):
+    with get_conn() as conn:
+        conn.execute(
+            'INSERT INTO app_settings (key, value) VALUES (?, ?) '
+            'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+            (key, str(value))
+        )
 
 
 if __name__ == '__main__':

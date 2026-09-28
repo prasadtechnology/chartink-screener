@@ -3,38 +3,42 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>VCP Scanner · Pattern detection for breakout setups</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<title>VCP Scanner</title>
 <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
 <script src="{{ url_for('static', filename='lightweight-charts.standalone.production.js') }}"></script>
 </head>
 <body>
+<script>try{var v=localStorage.getItem('vcp_theme_v1');var M={light:'paper',gemini:'paper',teal:'neumorph',ledger:'neumorph',sage:'neumorph',dark:'glass',aurora:'glass',graphite:'glass',nebula:'glass',amber:'glass',terminal:'glass',midnight:'glass',dusk:'glass',fjord:'glass'};if(M[v])v=M[v];var D={paper:0,neumorph:0,tactile:0,glass:1,visionos:1};if(!(v in D))v='neumorph';document.body.dataset.theme=v;if(D[v])document.body.classList.add('theme-dark');}catch(e){}</script>
 
-<div class="bg-grid"></div>
-
-<header class="site-header">
+<header class="topbar">
   <div class="brand">
-    <span class="brand-mark">◆</span>
-    <span class="brand-name">VCP<span class="brand-sep">·</span>Scanner</span>
+    <svg class="brand-mark" width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 12 5 7l3 2 3-5 4 2"/></svg>
+    <span class="brand-name">VCP Scanner</span>
   </div>
-  <nav class="main-nav">
+  <nav class="main-nav" aria-label="Main">
     <button class="nav-tab active" data-view="scan">Scan</button>
+    <button class="nav-tab" data-view="sectors">Sectors</button>
     <button class="nav-tab" data-view="holdings">Holdings <span class="nav-count" id="navHoldingsCount">0</span></button>
+    <button class="nav-tab" data-view="journal">Journal</button>
+    <button class="nav-tab" data-view="breadth">Breadth</button>
   </nav>
-  <div class="header-meta">
-    <span class="status-dot" id="statusDot"></span>
-    <span id="statusText">Idle</span>
-    <span class="header-divider"></span>
-    <button class="notif-toggle" id="notifToggle" title="Toggle alerts">
-      <span class="notif-icon" id="notifIcon">🔔</span>
+  <div class="topbar-right">
+    <div class="header-search">
+      <svg class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      <input id="symSearch" type="text" placeholder="Search symbol" autocomplete="off" spellcheck="false" aria-label="Search a symbol">
+      <kbd class="search-kbd">/</kbd>
+      <div class="search-suggest hidden" id="searchSuggest"></div>
+    </div>
+    <span class="status" title="Scanner status"><span class="status-dot" id="statusDot"></span><span id="statusText">Idle</span></span>
+    <a class="kite-pill hidden" id="kitePill">Connect Kite</a>
+    <button class="icon-btn notif-toggle" id="notifToggle" title="Toggle alerts" aria-label="Toggle alerts">
+      <span class="notif-icon" id="notifIcon"><svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg></span>
     </button>
-    <button class="theme-toggle" id="themeToggle" title="Toggle dark mode">🌙</button>
-    <span class="user-pill" id="userPill" title="Click to log out">
+    <button class="icon-btn theme-toggle" id="themeToggle" title="Switch theme" aria-label="Choose theme" aria-haspopup="menu"></button>
+    <button class="user-pill" id="userPill" title="Sign out">
       <span class="user-avatar" id="userAvatar">·</span>
-      <span id="userName">…</span>
-    </span>
+      <span class="user-name" id="userName">…</span>
+    </button>
   </div>
 </header>
 
@@ -43,88 +47,65 @@
 <!-- ================= SCAN VIEW ================= -->
 <div class="view" id="scanView">
 
-  <!-- Compact intro + uploader (side-by-side layout) -->
-  <section class="page-intro" id="heroSection">
-    <div class="intro-left">
-      <h1 class="page-title">Charts</h1>
-      <p class="page-sub">Drop a Chartink CSV to browse stocks chart-by-chart.</p>
-      <div class="exchange-pick">
-        <span>Exchange</span>
-        <label><input type="radio" name="exch" value="NSE" checked> NSE</label>
-        <label><input type="radio" name="exch" value="BSE"> BSE</label>
+  <section class="scan-bar">
+    <div class="scan-bar-left">
+      <h1 class="page-title">Scan</h1>
+      <div class="seg exchange-pick" role="radiogroup" aria-label="Exchange">
+        <label class="seg-opt"><input type="radio" name="exch" value="NSE" checked><span>NSE</span></label>
+        <label class="seg-opt"><input type="radio" name="exch" value="BSE"><span>BSE</span></label>
       </div>
+      <div class="seg source-pick" id="sourcePick" role="group" aria-label="Chart data source" title="Chart data provider. Kite is more reliable for NSE/BSE; needs a Kite login.">
+        <button type="button" class="src-opt active" data-source="yfinance">yfinance</button>
+        <button type="button" class="src-opt" data-source="kite">Kite</button>
+      </div>
+      <span class="src-status" id="srcStatus"></span>
     </div>
 
-    <div class="dropzone" id="dropzone">
-      <input type="file" id="fileInput" multiple accept=".csv" hidden>
-      <div class="dropzone-inner">
-        <div class="dropzone-icon">
-          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4">
-            <path d="M12 3v14M5 10l7-7 7 7M5 21h14"/>
-          </svg>
-        </div>
-        <div class="dropzone-text">
+    <div class="scan-bar-right">
+      <div class="drop-wrap" id="heroSection">
+        <div class="dropzone" id="dropzone" role="button" tabindex="0" aria-label="Upload Chartink CSV files">
+          <input type="file" id="fileInput" multiple accept=".csv" hidden>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 15V3M7 8l5-5 5 5M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"/></svg>
           <span class="dz-primary">Drop Chartink CSVs</span>
-          <span class="dz-secondary">or click · multiple files</span>
+          <span class="dz-secondary">or click</span>
         </div>
       </div>
-    </div>
-  </section>
 
-  <!-- Empty state shown before any CSV is dropped -->
-  <section class="scan-empty" id="scanEmpty">
-    <div class="scan-empty-grid">
-      <div class="se-card">
-        <div class="se-icon">📂</div>
-        <div class="se-title">Drop a CSV</div>
-        <div class="se-body">Export from Chartink as CSV. Multiple files are merged and de-duplicated automatically.</div>
-      </div>
-      <div class="se-card">
-        <div class="se-icon">⌨️</div>
-        <div class="se-title">Browse fast</div>
-        <div class="se-body">Use <kbd>J</kbd> / <kbd>K</kbd> or <kbd>←</kbd> / <kbd>→</kbd> to navigate. <kbd>I</kbd> to mark interested, <kbd>S</kbd> to skip.</div>
-      </div>
-      <div class="se-card">
-        <div class="se-icon">📁</div>
-        <div class="se-title">Organize</div>
-        <div class="se-body">Move charts to custom sections (Watching, Avoid, Re-entry, etc.) as you go.</div>
-      </div>
-      <div class="se-card">
-        <div class="se-icon">📊</div>
-        <div class="se-title">Sector strength</div>
-        <div class="se-body">Check the Sector Leaders tab to see which sectors are outperforming Nifty over the last 3 months.</div>
-      </div>
-    </div>
-  </section>
-
-  <!-- Parse summary + actions in one compact row -->
-  <section class="parse-summary hidden" id="parseSection">
-    <div class="parse-row">
-      <div class="parse-stats-inline">
-        <span class="ps-item"><b id="statFiles">—</b> files</span>
-        <span class="ps-sep">·</span>
-        <span class="ps-item"><b id="statRaw">—</b> raw</span>
-        <span class="ps-sep">·</span>
-        <span class="ps-item"><b class="neg" id="statDups">—</b> dupes</span>
-        <span class="ps-sep">·</span>
-        <span class="ps-item"><b class="pos" id="statUnique">—</b> unique</span>
-      </div>
-      <div class="parse-actions">
-        <button class="btn-primary" id="browseBtn">Browse charts →</button>
-        <button class="btn-link-action" id="screenBtn" title="Optional: run the algorithmic VCP/flag screener">Run algo screener</button>
-        <details class="file-details inline">
+      <div class="parse-summary hidden" id="parseSection">
+        <div class="parse-stats-inline">
+          <span class="ps-item"><b id="statFiles">—</b> files</span>
+          <span class="ps-item"><b id="statRaw">—</b> raw</span>
+          <span class="ps-item"><b class="neg" id="statDups">—</b> dupes</span>
+          <span class="ps-item"><b class="pos" id="statUnique">—</b> unique</span>
+        </div>
+        <details class="file-details">
           <summary>Files</summary>
-          <div id="perFile"></div>
+          <div class="file-details-pop" id="perFile"></div>
         </details>
-        <button class="btn-link" id="resetBtn">Reset</button>
+        <button class="btn" id="screenBtn" title="Optional: run the algorithmic VCP/flag screener">Run screener</button>
+        <button class="btn btn-primary" id="browseBtn">Browse charts</button>
+        <button class="btn btn-ghost" id="resetBtn" title="Clear this upload">Reset</button>
       </div>
+    </div>
+  </section>
+
+  <!-- First-run hint, shown only when nothing is loaded -->
+  <section class="scan-empty" id="scanEmpty">
+    <h2 class="scan-empty-title">Drop a Chartink CSV to start</h2>
+    <p class="scan-empty-sub">Export a screen from Chartink, drop it anywhere on this page, then flip through the charts with the keyboard.</p>
+    <div class="scan-empty-keys">
+      <span><kbd>J</kbd><kbd>K</kbd> next / previous</span>
+      <span><kbd>I</kbd> interested</span>
+      <span><kbd>S</kbd> skip</span>
+      <span><kbd>F</kbd> focus chart</span>
+      <span><kbd>/</kbd> search any symbol</span>
     </div>
   </section>
 
   <!-- Progress -->
   <section class="progress-section hidden" id="progressSection">
     <div class="section-head">
-      <h2 class="label">02 · Screening</h2>
+      <h2 class="label">Screening</h2>
       <span class="progress-count" id="progressCount">0 / 0</span>
     </div>
     <div class="progress-bar">
@@ -150,15 +131,34 @@
 
 </div>
 
+<!-- ================= SECTORS VIEW ================= -->
+<div class="view hidden" id="sectorsView">
+  <section class="page-head">
+    <h1 class="page-title">Sectors</h1>
+    <p class="page-sub">NSE sectoral indices ranked by relative strength vs Nifty</p>
+  </section>
+  <div id="sectorsBody"></div>
+</div>
+
 <!-- ================= HOLDINGS VIEW ================= -->
 <div class="view hidden" id="holdingsView">
 
-  <section class="page-intro">
+  <section class="page-head">
     <h1 class="page-title">Holdings</h1>
-    <p class="page-sub">Live P&amp;L, open risk (if all stops hit), locked profit (if stop is trailed above entry), and R-multiple for each position. Stored in your browser.</p>
+    <p class="page-sub">Live P&amp;L, open risk if every stop is hit, and R for each position</p>
+    <div class="page-actions kite-actions">
+      <button class="btn" id="refreshHoldingsBtn">Refresh prices</button>
+      <button class="btn btn-kite--connect hidden" id="connectKiteBtn" title="Log in to Kite in your browser — no API key/secret needed. Read-only.">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 17H7A5 5 0 0 1 7 7h2"/><path d="M15 7h2a5 5 0 0 1 0 10h-2"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
+        <span class="btn-label">Connect Kite</span>
+      </button>
+      <button class="btn btn-kite--sync hidden" id="syncKiteBtn" title="Import your Kite holdings &amp; positions. Anything you've sold in Kite moves to the journal. Read-only — no orders are placed.">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>
+        <span class="btn-label">Sync from Kite</span>
+      </button>
+    </div>
   </section>
 
-  <!-- Holdings summary stats -->
   <section id="holdingsSummarySection" class="hidden">
     <div class="stat-row">
       <div class="stat">
@@ -167,10 +167,10 @@
       </div>
       <div class="stat">
         <span class="stat-label">Invested</span>
-        <span class="stat-val mono-lg" id="hsInvested">—</span>
+        <span class="stat-val" id="hsInvested">—</span>
       </div>
       <div class="stat">
-        <span class="stat-label">Total P&amp;L</span>
+        <span class="stat-label">Unrealised P&amp;L</span>
         <span class="stat-val" id="hsPnl">—</span>
       </div>
       <div class="stat">
@@ -180,69 +180,82 @@
     </div>
   </section>
 
-  <!-- Add holding form -->
-  <section class="holding-form-section">
-    <div class="section-head">
-      <h2 class="label">Add position</h2>
-      <button class="btn-link" id="refreshHoldingsBtn">Refresh prices</button>
+  <section id="holdingsListSection" class="table-card">
+    <div id="holdingsEmpty" class="empty-state">
+      <p>No open positions. Add one below, sync from Kite, or <button class="btn-link inline" id="loadSampleBtn">load sample data</button>.</p>
     </div>
-    <form id="holdingForm" class="holding-form" onsubmit="return false">
-      <div class="hf-field">
-        <label>Symbol</label>
-        <input type="text" id="hfSymbol" placeholder="MTARTECH" autocomplete="off" required>
-      </div>
-      <div class="hf-field">
-        <label>Exchange</label>
-        <select id="hfExchange">
-          <option value="NSE">NSE</option>
-          <option value="BSE">BSE</option>
-        </select>
-      </div>
-      <div class="hf-field">
-        <label>Entry ₹</label>
-        <input type="number" id="hfEntry" step="0.01" placeholder="3776" required>
-      </div>
-      <div class="hf-field">
-        <label>Stop ₹</label>
-        <input type="number" id="hfStop" step="0.01" placeholder="3500" required>
-      </div>
-      <div class="hf-field">
-        <label>Qty</label>
-        <input type="number" id="hfQty" step="1" placeholder="100" required>
-      </div>
-      <button type="submit" class="btn-primary" id="addHoldingBtn">
-        <span>Add</span><span class="btn-arrow">+</span>
-      </button>
+    <div class="holdings-table hidden" id="holdingsTable"></div>
+    <form id="holdingForm" class="holding-form" onsubmit="return false" aria-label="Add position">
+      <input type="text" id="hfSymbol" placeholder="Symbol" aria-label="Symbol" autocomplete="off" required>
+      <select id="hfExchange" aria-label="Exchange">
+        <option value="NSE">NSE</option>
+        <option value="BSE">BSE</option>
+      </select>
+      <input type="text" inputmode="decimal" id="hfEntry" placeholder="Entry ₹" aria-label="Entry price" required>
+      <input type="text" inputmode="decimal" id="hfStop" placeholder="Stop ₹" aria-label="Stop price" required>
+      <input type="text" inputmode="numeric" id="hfQty" placeholder="Qty" aria-label="Quantity" required>
+      <span class="hf-hint" id="hfHint"></span>
+      <button type="submit" class="btn btn-primary" id="addHoldingBtn">Add position</button>
     </form>
   </section>
 
-  <!-- Holdings table -->
-  <section id="holdingsListSection">
-    <div class="section-head">
-      <h2 class="label">Open positions</h2>
-    </div>
-    <div id="holdingsEmpty" class="empty-state">
-      <p>No positions yet. Add one above, or <button class="btn-link inline" id="loadSampleBtn">load sample</button>.</p>
-    </div>
-    <div class="holdings-table hidden" id="holdingsTable"></div>
-  </section>
+</div>
 
+<!-- ================= JOURNAL VIEW ================= -->
+<div class="view hidden" id="journalView">
+  <section class="page-head">
+    <h1 class="page-title">Journal</h1>
+    <p class="page-sub">Performance across every closed trade</p>
+    <span class="page-actions journal-actions">
+      <button class="btn btn-kite--sync hidden" id="pullJournalBtn" title="Import today's executed trades from Kite as round-trip journal entries. Read-only — no orders are placed.">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 12 5 5 5-5"/><path d="M5 21h14"/></svg>
+        <span class="btn-label">Pull today's trades</span>
+      </button>
+      <input type="file" id="consoleFileInput" accept=".xlsx,.xls,.csv" hidden>
+      <button class="btn btn-kite--connect" id="importConsoleBtn" title="Import realised P&amp;L from a Kite Console P&amp;L export (Console → Reports → P&amp;L → Download). Uses Kite's exact realised figures.">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3v4a1 1 0 0 0 1 1h4"/><path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2Z"/><path d="M12 17v-6"/><path d="m9.5 13.5 2.5 2.5 2.5-2.5"/></svg>
+        <span class="btn-label">Import Console P&amp;L</span>
+      </button>
+    </span>
+  </section>
+  <div id="journalBody"></div>
+</div>
+
+<!-- ================= BREADTH VIEW ================= -->
+<div class="view hidden" id="breadthView">
+  <section class="page-head">
+    <h1 class="page-title">Market breadth</h1>
+    <p class="page-sub">Unique stocks your scan surfaces each day. Rising means broadening participation; falling means the market is narrowing.</p>
+  </section>
+  <div id="breadthBody"></div>
 </div>
 
 </main>
 
 <!-- Detail modal -->
-<div class="modal-backdrop hidden" id="modal">
+<div class="modal-backdrop hidden" id="modal" role="dialog" aria-modal="true" aria-label="Chart">
   <div class="modal">
-    <button class="modal-close" id="modalClose">×</button>
+    <button class="modal-close" id="modalClose" aria-label="Close chart" title="Close (Esc)"><svg class="icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
     <div class="modal-content" id="modalContent"></div>
   </div>
 </div>
 
-<footer class="site-footer">
-  <span>Built for Minervini-style trend following. Not investment advice.</span>
-  <span class="footer-meta">Data via yfinance · Pattern detection: <span class="mono">VCP · flat · cup</span></span>
-</footer>
+<!-- Toast notifications (non-blocking feedback) -->
+<div class="drop-overlay hidden" id="dropOverlay"><div class="drop-overlay-inner">Drop Chartink CSVs to load them</div></div>
+
+<div class="toast-host" id="toastHost" aria-live="polite" aria-atomic="false"></div>
+
+<!-- Styled confirm dialog (replaces window.confirm) -->
+<div class="confirm-backdrop hidden" id="confirmBackdrop" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
+  <div class="confirm-box">
+    <h3 class="confirm-title" id="confirmTitle">Are you sure?</h3>
+    <p class="confirm-msg" id="confirmMsg"></p>
+    <div class="confirm-actions">
+      <button type="button" id="confirmCancel">Cancel</button>
+      <button type="button" id="confirmOk">Confirm</button>
+    </div>
+  </div>
+</div>
 
 <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>

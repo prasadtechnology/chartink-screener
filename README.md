@@ -67,10 +67,69 @@ Chart data is cached in SQLite per symbol per timeframe per day. First view of T
 
 ## Configuration
 
-Two environment variables:
+Environment variables:
 
 - `ALLOW_SIGNUP=1` — unlock signup (default: locked after first user)
 - `VCP_SECRET_PATH=/path/to/secret` — Flask session signing key (default: `.flask_secret` in cwd, auto-generated)
+- `VCP_DB_PATH=/path/to/vcp_scanner.db` — SQLite database location (default: `vcp_scanner.db` in cwd)
+- `COOKIE_SECURE=1` — mark session cookies `Secure` (set this on any HTTPS deployment; leave unset for local HTTP dev)
+- `DATA_SOURCE=kite` — use Zerodha Kite Connect for live + historical data instead of yfinance (default: `yfinance`)
+- `KITE_API_KEY` / `KITE_API_SECRET` — your Kite Connect app credentials (required when `DATA_SOURCE=kite`)
+
+## Live data via Kite Connect (optional)
+
+By default the app uses **yfinance** (free, unofficial, delayed/rate-limited).
+For real-time, reliable data you can switch to **Zerodha Kite Connect**:
+
+1. Subscribe to Kite Connect (data API, ~₹500/month) and create an app at
+   [developers.kite.trade](https://developers.kite.trade). Set its **redirect URL**
+   to `http://127.0.0.1:5000/kite/callback`.
+2. Export before launching:
+   ```bash
+   DATA_SOURCE=kite KITE_API_KEY=xxx KITE_API_SECRET=yyy python app.py
+   ```
+3. A **Connect Kite** pill appears in the header. Click it once each day to log in
+   (Kite access tokens expire daily). After that, the screener, holdings and sector
+   data all use your live Kite feed; the token is cached in `.kite_token`.
+
+If Kite isn't configured or you haven't logged in for the day, the app falls back
+to yfinance automatically — nothing breaks.
+
+### Sync your portfolio from Kite
+
+Once you've connected Kite, a **⟳ Sync from Kite** button appears on the Holdings
+tab (and the app auto-syncs once each time it loads). Sync is **read-only — it never
+places orders** on your account. It:
+
+- imports your Kite **holdings** and open **positions** (long-only) as portal positions,
+  tagged with a `Kite` badge;
+- fills each **stop** from a matching stop-loss **GTT** if you have one; otherwise the
+  stop is left unset (shown as `⚠ set stop`) so risk/R stay honest until you add one;
+- **closes** any previously-synced position that's gone from Kite (i.e. you sold it) into
+  your **journal**, using the actual realised sell price for the day, falling back to the
+  last traded price.
+
+Manually-added positions are never touched by sync. Portfolio sync works even when
+`DATA_SOURCE=yfinance`, as long as you've connected Kite for the day.
+
+### Portfolio sync without an API key (browser login)
+
+Don't want to create a Kite Connect app / manage an API key + secret? The portal
+can sync your holdings through **Zerodha's hosted Kite MCP** (`mcp.kite.trade`)
+instead — the app connects to it directly (no LLM/assistant involved) and you just
+log in through the browser:
+
+1. On the **Holdings** tab, click **🔗 Connect Kite**.
+2. A Zerodha login opens in a new tab — sign in (username + 2FA). No API key needed.
+3. The portal detects the login and syncs automatically; the **⟳ Sync from Kite**
+   button then refreshes on demand.
+
+This path is **strictly read-only** — the app only ever calls Kite's read tools
+(`get_holdings`, `get_positions`, `get_gtts`, `get_trades`, `get_ltp`), and the
+hosted MCP blocks order-placement tools entirely. The login lasts for the day, like
+Kite Connect. Note it relies on Zerodha's hosted MCP service, which is newer than
+the Kite Connect API; if you want the most officially-supported path, use the API
+key/secret option above.
 
 ## Backtest scripts (for reference, not deployed)
 

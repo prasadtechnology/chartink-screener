@@ -2,6 +2,7 @@
 VCP screener — core scoring + entry/stop-loss logic for the web app.
 Extends the CLI version with explicit entry/SL fields and pattern classification.
 """
+import math
 import warnings
 import numpy as np
 import pandas as pd
@@ -33,10 +34,54 @@ CONFIG = {
 }
 
 
+_src_cache = {'val': None, 't': 0.0}
+
+
+def chart_source():
+    """Selected chart data source: 'kite' or 'yfinance'.
+
+    A saved app setting (toggled in the UI) overrides the DATA_SOURCE env default.
+    Cached for a few seconds so the per-symbol screener doesn't hit the DB each call.
+    """
+    import os
+    import time as _t
+    now = _t.time()
+    if _src_cache['val'] is None or now - _src_cache['t'] > 3:
+        val = 'yfinance'
+        try:
+            import db
+            default = 'kite' if os.environ.get('DATA_SOURCE', '').strip().lower() == 'kite' else 'yfinance'
+            val = db.get_setting('chart_source', default) or default
+        except Exception:
+            val = 'yfinance'
+        _src_cache['val'] = val
+        _src_cache['t'] = now
+    return _src_cache['val']
+
+
 def fetch_ohlc(ticker, days=400, interval='1d'):
-    """Fetch OHLC. interval: '1d', '1wk', '1h'.
-    For hourly, yfinance caps period at ~730 days. For weekly we need more
-    calendar to get a similar number of bars, so we widen the period."""
+    """Fetch OHLC. interval: '1d', '1wk', '1h'. Uses Kite when selected (API-key
+    path or the browser-login MCP), otherwise yfinance (which caps 1h at ~730d
+    and needs a wider weekly window). Falls back to yfinance on any Kite failure."""
+    min_bars = 30 if interval == '1h' else (40 if interval == '1wk' else 100)
+
+    # Preferred source: Kite when selected/configured; API key first, else the MCP.
+    try:
+        import kite_data
+        import kite_mcp
+        if chart_source() == 'kite' or kite_data.active():
+            if kite_data.active():
+                kdf = kite_data.fetch_ohlc(ticker, days=days, interval=interval)
+                if kdf is not None and len(kdf) >= min_bars:
+                    return kdf
+            if kite_mcp.data_ready():
+                mdf = kite_mcp.fetch_ohlc(ticker, days=days, interval=interval)
+                if mdf is not None and len(mdf) >= min_bars:
+                    return mdf
+            # else fall through to yfinance
+    except Exception as e:
+        print(f'[kite] fetch_ohlc -> yfinance fallback: {e}')
+
     if interval == '1h':
         period_str = f'{min(days, 720)}d'
     elif interval == '1wk':
@@ -46,12 +91,29 @@ def fetch_ohlc(ticker, days=400, interval='1d'):
 
     df = yf.download(ticker, period=period_str, interval=interval, progress=False,
                      auto_adjust=True, threads=False)
-    min_bars = 30 if interval == '1h' else (40 if interval == '1wk' else 100)
     if df is None or df.empty or len(df) < min_bars:
         return None
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] for c in df.columns]
-    df.columns = [c.lower() for c in df.columns]
+        # yfinance usually puts the OHLC field names on level 0, but the level
+        # order can vary (sometimes the ticker sits on level 0). Pick whichever
+        # level actually carries the field names, else fall back to level 0.
+        lvl = 0
+        for i in range(df.columns.nlevels):
+            names = {str(x).lower() for x in df.columns.get_level_values(i)}
+            if {'open', 'high', 'low', 'close'} & names:
+                lvl = i
+                break
+        df.columns = df.columns.get_level_values(lvl)
+    df.columns = [str(c).lower() for c in df.columns]
+    # Guard against duplicate columns (e.g. a bad collapse) so df['close'] stays
+    # a Series rather than a DataFrame downstream.
+    df = df.loc[:, ~df.columns.duplicated()]
+    # yfinance often appends a trailing NaN-close row (current in-progress bar /
+    # holiday) which would make the last-bar price and indicators NaN.
+    if 'close' in df.columns:
+        df = df.dropna(subset=['close'])
+    if df.empty or len(df) < min_bars:
+        return None
     return df
 
 
@@ -331,22 +393,6 @@ def classify_pattern(pullbacks_clean, base_weeks, base_range_pct):
     if max_pb <= 12:
         return 'Tight range'
     return 'Loose base'
-    """Classify the base type based on structure."""
-    if not pullbacks_clean:
-        return 'Unknown'
-    n = len(pullbacks_clean)
-    max_pb = max(pullbacks_clean)
-    if n >= 3 and max_pb <= 20 and pullbacks_clean[-1] <= 6:
-        return 'VCP (tight)'
-    if n >= 2 and max_pb <= 35 and pullbacks_clean[-1] <= 10:
-        return 'VCP'
-    if max_pb >= 30 and base_weeks >= 7:
-        return 'Cup base'
-    if base_range_pct <= 15 and n <= 2:
-        return 'Flat base'
-    if max_pb <= 12:
-        return 'Tight range'
-    return 'Loose base'
 
 
 def compute_entry_stop(df, base_start_abs, swings_abs, pullbacks_clean, cfg):
@@ -407,9 +453,16 @@ def score_and_analyse(ticker, cfg=CONFIG):
     if df is None:
         return {'ticker': ticker, 'error': 'Insufficient data', 'score': 0}
 
-    close = df['close']
-    high = df['high']
-    low = df['low']
+    # Defensive: if a data source ever returns duplicate columns, df['close']
+    # is a DataFrame, not a Series — collapse to the first column so the scalar
+    # conversions below can't raise "cannot convert the series to float".
+    def _series(col):
+        s = df[col]
+        return s.iloc[:, 0] if isinstance(s, pd.DataFrame) else s
+
+    close = _series('close')
+    high = _series('high')
+    low = _series('low')
     cur = float(close.iloc[-1])
 
     result = {
@@ -418,6 +471,32 @@ def score_and_analyse(ticker, cfg=CONFIG):
         'notes': [],
         'pass': False,
         'current_price': round(cur, 2),
+    }
+
+    # OHLC data for the frontend chart (last 180 days). Built up-front so the
+    # chart is present even when the analysis short-circuits below (no base, too
+    # few swings, <200d history) — the review UI still needs to draw the chart.
+    last_n = min(180, len(df))
+    df_tail = df.tail(last_n)
+    mas = compute_moving_averages(df)
+
+    def _ma_clean(series):
+        out = []
+        for v in series.tail(last_n):
+            v = float(v)
+            out.append(None if math.isnan(v) else round(v, 2))
+        return out
+
+    result['chart'] = {
+        'dates': df_tail.index.strftime('%Y-%m-%d').tolist(),
+        'open': [round(float(x), 2) for x in df_tail['open']],
+        'high': [round(float(x), 2) for x in df_tail['high']],
+        'low': [round(float(x), 2) for x in df_tail['low']],
+        'close': [round(float(x), 2) for x in df_tail['close']],
+        'volume': [int(x) for x in df_tail['volume']],
+        'ma10': _ma_clean(mas['ma10']),
+        'ma20': _ma_clean(mas['ma20']),
+        'ma50': _ma_clean(mas['ma50']),
     }
 
     # Stage 2
@@ -593,29 +672,6 @@ def score_and_analyse(ticker, cfg=CONFIG):
     if entry_info:
         result.update(entry_info)
 
-    # OHLC data for frontend chart (last 180 days)
-    last_n = min(180, len(df))
-    df_tail = df.tail(last_n)
-    mas = compute_moving_averages(df)
-    def _ma_clean(series):
-        import math
-        out = []
-        for v in series.tail(last_n):
-            v = float(v)
-            out.append(None if math.isnan(v) else round(v, 2))
-        return out
-
-    result['chart'] = {
-        'dates': df_tail.index.strftime('%Y-%m-%d').tolist(),
-        'open': [round(float(x), 2) for x in df_tail['open']],
-        'high': [round(float(x), 2) for x in df_tail['high']],
-        'low': [round(float(x), 2) for x in df_tail['low']],
-        'close': [round(float(x), 2) for x in df_tail['close']],
-        'volume': [int(x) for x in df_tail['volume']],
-        'ma10': _ma_clean(mas['ma10']),
-        'ma20': _ma_clean(mas['ma20']),
-        'ma50': _ma_clean(mas['ma50']),
-    }
     # Base-start date for chart shading
     if base_start_abs < len(df):
         bs_date = df.index[base_start_abs].strftime('%Y-%m-%d')

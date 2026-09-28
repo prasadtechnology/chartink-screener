@@ -14,6 +14,9 @@ services:
         value: /var/data/.flask_secret
       - key: VCP_DB_PATH
         value: /var/data/vcp_scanner.db
+      # Render terminates TLS, so mark session cookies Secure.
+      - key: COOKIE_SECURE
+        value: "1"
       # Set ALLOW_SIGNUP=1 in dashboard ONLY for the very first signup, then remove
     disk:
       name: vcp-data
