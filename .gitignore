@@ -40,3 +40,6 @@ build/
 backtest_cache/
 backtest_results*.json
 *_results.json
+
+# claude outputs
+Claude outputs/

@@ -1034,31 +1034,28 @@ function detectAndAlertStopHits(holdings) {
 // ---------------------------------------------------------------------------
 const THEME_KEY = 'vcp_theme_v1';
 
-// Five palettes on one layout. Each is a set of CSS tokens (see styles.css);
+// Palettes on one layout. Each is a set of CSS tokens (see styles.css);
 // green/red always mean price & P&L, the accent is the only thing that changes role.
 const THEMES = [
   { id: 'paper',    label: 'Paper',    dark: false, sw: '#2457c5', bg: '#f6f6f4', note: 'Neutral light' },
-  { id: 'ledger',   label: 'Ledger',   dark: false, sw: '#0f6b63', bg: '#f3efe6', note: 'Warm cream, teal' },
-  { id: 'graphite', label: 'Graphite', dark: true,  sw: '#6ea4ff', bg: '#0f1012', note: 'Neutral dark' },
-  { id: 'midnight', label: 'Midnight', dark: true,  sw: '#4cc3e6', bg: '#0b1220', note: 'Deep navy, cyan' },
-  { id: 'terminal', label: 'Terminal', dark: true,  sw: '#f2a23a', bg: '#0a0a0a', note: 'Black, amber' },
-  // Comfort palettes: softer contrast, no pure white/black — easier for long sessions
-  { id: 'sage',     label: 'Sage',     dark: false, comfort: true, sw: '#3b6784', bg: '#e9ede6', note: 'Soft green-grey, low glare' },
-  { id: 'dusk',     label: 'Dusk',     dark: true,  comfort: true, sw: '#b9a6e4', bg: '#1b1816', note: 'Warm charcoal, low blue light' },
-  { id: 'fjord',    label: 'Fjord',    dark: true,  comfort: true, sw: '#8cb8dc', bg: '#1e2430', note: 'Soft slate blue' },
+  { id: 'neumorph', label: 'Neumorphism', dark: false, sw: '#4f5bd5', bg: '#e4e9f0', note: 'Soft extruded, dual shadows' },
+  { id: 'tactile',  label: 'Tactile',  dark: false, sw: '#c2410c', bg: '#ebe7e0', note: 'Physical keys, recessed wells' },
+  { id: 'glass',    label: 'Liquid Glass', dark: true, sw: '#7cc4ff', bg: '#0b1020', note: 'Frosted translucent, vivid backdrop' },
+  { id: 'visionos', label: 'visionOS', dark: true,  sw: '#ffffff', bg: '#363b4b', note: 'Neutral glass, capsule controls' },
 ];
 const THEME_IDS = THEMES.map(t => t.id);
+const DEFAULT_THEME = 'neumorph';
 
-// Older stored values (light/dark and the retired gemini/teal/paper/aurora/nebula/amber)
+// Older stored values (light/dark and the retired gemini/teal/aurora/nebula/amber/graphite/terminal/ledger/midnight/sage/dusk/fjord)
 // map to the nearest current palette.
-const THEME_MIGRATE = { light: 'paper', gemini: 'paper', teal: 'ledger', dark: 'graphite', aurora: 'graphite', nebula: 'midnight', amber: 'terminal' };
+const THEME_MIGRATE = { light: 'paper', gemini: 'paper', teal: 'neumorph', ledger: 'neumorph', sage: 'neumorph', dark: 'glass', aurora: 'glass', graphite: 'glass', nebula: 'glass', amber: 'glass', terminal: 'glass', midnight: 'glass', dusk: 'glass', fjord: 'glass' };
 function getTheme() {
   let v = localStorage.getItem(THEME_KEY);
   if (v === 'paper') return 'paper';
   if (THEME_MIGRATE[v]) v = THEME_MIGRATE[v];
-  return THEME_IDS.includes(v) ? v : 'paper';
+  return THEME_IDS.includes(v) ? v : DEFAULT_THEME;
 }
-function _themeMeta(id) { return THEMES.find(t => t.id === id) || THEMES[0]; }
+function _themeMeta(id) { return THEMES.find(t => t.id === id) || THEMES.find(t => t.id === DEFAULT_THEME); }
 
 function applyTheme(id) {
   const meta = _themeMeta(id);
@@ -1100,9 +1097,8 @@ function openThemeMenu() {
       <span class="tm-label">${t.label}<i>${t.note}</i></span>
       ${t.id === cur ? svgIcon('check', 14) : ''}
     </button>`;
-  menu.innerHTML = `<div class="tm-head">Light</div>${THEMES.filter(t => !t.dark && !t.comfort).map(item).join('')}
-    <div class="tm-head">Dark</div>${THEMES.filter(t => t.dark && !t.comfort).map(item).join('')}
-    <div class="tm-head">Easy on the eyes</div>${THEMES.filter(t => t.comfort).map(item).join('')}`;
+  menu.innerHTML = `<div class="tm-head">Light</div>${THEMES.filter(t => !t.dark).map(item).join('')}
+    <div class="tm-head">Dark</div>${THEMES.filter(t => t.dark).map(item).join('')}`;
   document.body.appendChild(menu);
   const r = btn.getBoundingClientRect();
   menu.style.top = `${r.bottom + 6}px`;
